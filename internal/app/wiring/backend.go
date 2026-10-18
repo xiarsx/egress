@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"time"
 
 	pklease "github.com/xiarsx/egress/pkg/lease"
 	pknode "github.com/xiarsx/egress/pkg/node"
@@ -87,7 +88,44 @@ func toControlNode(n pknode.NodeSnapshot) control.Node {
 		Health:         health,
 		Failures:       failures,
 		TrippedSinceNs: sinceNs,
+
+		// Legacy-compatible fields for the ported admin console.
+		DisplayTag:       displayTag(tags),
+		HasOutbound:      n.HasOutbound,
+		Enabled:          true,
+		Region:           attrStr(attrs, "geo.country"),
+		CircuitOpenSince: trippedSinceStr(sinceNs),
+		FailureCount:     failures,
 	}
+}
+
+// displayTag returns the first tag with the "<source>/" prefix stripped,
+// e.g. "verify/US-Los Angeles-1" -> "US-Los Angeles-1".
+func displayTag(tags []string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	t := tags[0]
+	if i := strings.Index(t, "/"); i >= 0 {
+		t = t[i+1:]
+	}
+	return t
+}
+
+func attrStr(attrs map[string]any, key string) string {
+	v, ok := attrs[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+func trippedSinceStr(ns int64) string {
+	if ns <= 0 {
+		return ""
+	}
+	return time.Unix(0, ns).UTC().Format(time.RFC3339)
 }
 
 func addrStr(a netip.Addr) string {

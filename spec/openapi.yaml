@@ -934,6 +934,12 @@ components:
         health: { type: string, enum: [probing, healthy, tripped] }
         failures: { type: integer, description: healthy 下的连续失败计数 }
         tripped_since_ns: { type: integer }
+        display_tag: { type: string, description: 首个 tag 去掉 "<source>/" 前缀，用于管理后台显示 }
+        has_outbound: { type: boolean, description: 是否已构建出站实例 }
+        enabled: { type: boolean }
+        region: { type: string, description: attrs["geo.country"] 的便捷访问 }
+        circuit_open_since: { type: string, description: 熔断开始时间（RFC3339），tripped 时有效 }
+        failure_count: { type: integer }
     NodePage:
       type: object
       required: [items, total, limit, offset]

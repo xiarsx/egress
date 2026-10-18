@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS leases(
 	PRIMARY KEY(platform, account)
 );`,
 	},
+	{
+		version: 2,
+		name:    "nodes-has-outbound",
+		up:      `ALTER TABLE nodes ADD COLUMN has_outbound INTEGER NOT NULL DEFAULT 0;`,
+	},
 }
 
 // latencyKey addresses one (node, domain) latency sample in the dirty set.
@@ -203,8 +208,14 @@ func decodeAttrs(raw string) (map[pknode.AttrKey]pknode.AttrValue, error) {
 	return attrs, nil
 }
 
-func encodeHealth(h pknode.Health) (kind, failures int, since int64) {
-	kind = int(h.Kind)
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func encodeHealth(h pknode.Health) (kind, failures int, since int64) {	kind = int(h.Kind)
 	failures = h.Failures
 	if h.Kind == pknode.HealthTripped {
 		since = h.Since.UTC().UnixNano()
@@ -232,7 +243,7 @@ func (c *Cache) LoadSnapshot() (nodes []pknode.NodeSnapshot, sourceNodes map[str
 	ctx := context.Background()
 
 	rows, err := c.db.QueryContext(ctx, `
-		SELECT hash, raw_options, tags, attrs, health_kind, health_failures, health_since, egress_ip
+		SELECT hash, raw_options, tags, attrs, health_kind, health_failures, health_since, egress_ip, has_outbound
 		FROM nodes`)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("sqlite: load nodes: %w", err)
@@ -246,9 +257,10 @@ func (c *Cache) LoadSnapshot() (nodes []pknode.NodeSnapshot, sourceNodes map[str
 			tagsRaw, attrsRaw, egressIP string
 			healthKind, healthFailures  int
 			healthSince                 int64
+			hasOutboundInt              int
 		)
 		if err := rows.Scan(&hashBytes, &rawOptions, &tagsRaw, &attrsRaw,
-			&healthKind, &healthFailures, &healthSince, &egressIP); err != nil {
+			&healthKind, &healthFailures, &healthSince, &egressIP, &hasOutboundInt); err != nil {
 			rows.Close()
 			return nil, nil, nil, fmt.Errorf("sqlite: scan node: %w", err)
 		}
@@ -265,11 +277,12 @@ func (c *Cache) LoadSnapshot() (nodes []pknode.NodeSnapshot, sourceNodes map[str
 			return nil, nil, nil, fmt.Errorf("sqlite: decode attrs: %w", err)
 		}
 		n := pknode.NodeSnapshot{
-			Hash:       h,
-			RawOptions: rawOptions,
-			Tags:       tags,
-			Attrs:      attrs,
-			Health:     decodeHealth(healthKind, healthFailures, healthSince),
+			Hash:        h,
+			RawOptions:  rawOptions,
+			HasOutbound: hasOutboundInt != 0,
+			Tags:        tags,
+			Attrs:       attrs,
+			Health:      decodeHealth(healthKind, healthFailures, healthSince),
 		}
 		if addr, perr := netip.ParseAddr(egressIP); perr == nil {
 			n.EgressIP = addr
@@ -525,8 +538,8 @@ func (c *Cache) Flush() error {
 			egressIP = n.EgressIP.String()
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO nodes(hash, raw_options, tags, attrs, health_kind, health_failures, health_since, egress_ip)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO nodes(hash, raw_options, tags, attrs, health_kind, health_failures, health_since, egress_ip, has_outbound)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(hash) DO UPDATE SET
 				raw_options=excluded.raw_options,
 				tags=excluded.tags,
@@ -534,8 +547,9 @@ func (c *Cache) Flush() error {
 				health_kind=excluded.health_kind,
 				health_failures=excluded.health_failures,
 				health_since=excluded.health_since,
-				egress_ip=excluded.egress_ip`,
-			[]byte(k), rawOptions, tagsEnc, attrsEnc, hk, hf, hs, egressIP); err != nil {
+				egress_ip=excluded.egress_ip,
+				has_outbound=excluded.has_outbound`,
+			[]byte(k), rawOptions, tagsEnc, attrsEnc, hk, hf, hs, egressIP, boolToInt(n.HasOutbound)); err != nil {
 			return fmt.Errorf("sqlite: cache flush upsert node: %w", err)
 		}
 	}

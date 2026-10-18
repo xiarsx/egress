@@ -128,8 +128,12 @@ func (r *Registry) ApplySnapshot(source string, nodes []pknode.NodeSnapshot) {
 	rec.tags = newTags
 	for _, h := range newHashes {
 		if _, kept := oldSet[h]; kept {
-			// Re-published: only this source's tag contribution changed.
+			// Re-published: refresh the snapshot payload (a new snapshot
+			// may carry updated RawOptions/HasOutbound), then merge tags.
 			if nr := r.nodes[h]; nr != nil {
+				incoming := byHash[h]
+				nr.snap.RawOptions = append([]byte(nil), incoming.RawOptions...)
+				nr.snap.HasOutbound = incoming.HasOutbound
 				nr.snap.Tags = r.mergedTagsLocked(h)
 			}
 			continue

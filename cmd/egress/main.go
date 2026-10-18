@@ -109,6 +109,7 @@ func run() int {
 	svc := control.NewService(store, control.NopHooks{},
 		control.WithAdminToken(cfg.AdminToken),
 		control.WithVersion(appVersion()),
+		control.WithSystemConfig(bootSystemConfig(cfg)),
 	)
 	if err := config.EnsureDefaultPlatform(ctx, store); err != nil {
 		return fatalf("ensure default platform: %v", err)
@@ -397,6 +398,29 @@ func scheduleGeoIPRefresh(sched ports.Scheduler, registry *source.Registry, geo 
 		sched.Schedule(interval, tick)
 	}
 	sched.Schedule(interval, tick)
+}
+
+// bootSystemConfig builds the boot-time system config shown in the admin
+// console (GET /api/v1/system/config) from the actual startup environment.
+func bootSystemConfig(cfg config.Config) control.SystemConfig {
+	host, portStr, err := net.SplitHostPort(cfg.ListenAddr)
+	port := 0
+	if err == nil {
+		if p, perr := strconv.Atoi(portStr); perr == nil {
+			port = p
+		} else {
+			host = cfg.ListenAddr
+		}
+	} else {
+		host = cfg.ListenAddr
+	}
+	return control.SystemConfig{
+		ListenAddress: host,
+		Port:          port,
+		StateDir:      cfg.StateDir,
+		CacheDir:      cfg.CacheDir,
+		LogDir:        cfg.LogDir,
+	}
 }
 
 func appVersion() string {

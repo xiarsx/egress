@@ -293,6 +293,8 @@ const SystemConfigResourceName = "runtime"
 // ---------------------------------------------------------------------------
 
 // Node mirrors the openapi Node schema (runtime-owned; served via backend).
+// DisplayTag/HasOutbound/Enabled/Region/CircuitOpenSince/FailureCount are
+// legacy-compatible fields consumed by the ported React admin console.
 type Node struct {
 	Hash           string         `json:"hash"`
 	Tags           []string       `json:"tags"`
@@ -301,6 +303,13 @@ type Node struct {
 	Health         string         `json:"health"`
 	Failures       int            `json:"failures,omitempty"`
 	TrippedSinceNs int64          `json:"tripped_since_ns,omitempty"`
+
+	DisplayTag       string `json:"display_tag,omitempty"`
+	HasOutbound      bool   `json:"has_outbound"`
+	Enabled          bool   `json:"enabled"`
+	Region           string `json:"region,omitempty"`
+	CircuitOpenSince string `json:"circuit_open_since,omitempty"`
+	FailureCount     int    `json:"failure_count,omitempty"`
 }
 
 // Lease mirrors the openapi Lease schema (runtime-owned; served via backend).
