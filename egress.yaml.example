@@ -1,0 +1,60 @@
+# Example declarative resources for egress (EGRESS_CONFIG).
+# Applied on top of the built-in Default platform at startup.
+# apiVersion must be "egress/v1"; documents are separated by "---".
+
+# --- A custom platform: only nodes tagged with this source's prefix,
+# --- limited to a few regions, sticky sessions for 24h.
+apiVersion: egress/v1
+kind: Platform
+metadata:
+  name: hk-jp
+spec:
+  stickyTTL: 24h
+  allocation: BALANCED            # BALANCED | PREFER_LOW_LATENCY | PREFER_IDLE_IP
+  passiveBreaker: "on"            # "on" | "off" (off = passive failures don't trip the breaker)
+  identityPolicyRef: header-acct
+  filter:
+    tags: ["^example-sub/"]       # only nodes from the example-sub source
+    attrs:
+      geo.country: { in: [hk, jp] }
+---
+# --- A remote subscription source (refresh >= 30s). ---
+apiVersion: egress/v1
+kind: Source
+metadata:
+  name: example-sub
+spec:
+  type: remote
+  url: https://example.com/subscription.txt
+  updateInterval: 5m
+  enabled: true
+---
+# --- An inline (local) source: useful for a static node list. ---
+apiVersion: egress/v1
+kind: Source
+metadata:
+  name: static-nodes
+spec:
+  type: local
+  # Any format singbox.ParseSubscription accepts: sing-box/Clash JSON,
+  # URI lines (vmess://, vless://, trojan://, ss://, ...), or
+  # IP:PORT[:USER:PASS] lines. Base64-wrapped content is unwrapped.
+  content: |
+    trojan://password@example.net:443#static-1
+  updateInterval: 0s
+  enabled: true
+---
+# --- Identity policy referenced by the hk-jp platform above. ---
+apiVersion: egress/v1
+kind: IdentityPolicy
+metadata:
+  name: header-acct
+spec:
+  chain:
+    - header: X-Egress-Account   # 1. explicit account header
+    - wire: {}                   # 2. "Platform.Account" from the line protocol
+    - headerRule:                # 3. per-target header fallback
+        rules:
+          - prefix: "*"
+            headers: ["Authorization", "x-api-key"]
+  onMiss: random                 # random | reject

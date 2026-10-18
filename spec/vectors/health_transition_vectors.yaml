@@ -1,0 +1,58 @@
+# 健康状态迁移 conformance 向量
+# step(health, signal, cfg, now) -> health' 是纯函数：不读时钟，不做 I/O。
+# 来源：设计 §2.4 状态迁移表。阈值取 maxConsecutiveFailures = 3。
+version: 1
+config:
+  maxConsecutiveFailures: 3
+vectors:
+  - name: node_added_becomes_probing
+    current: null
+    signal: node_added
+    expect: { health: probing, note: "入队高优先级出口探测" }
+  - name: probing_ok_becomes_healthy
+    current: { health: probing }
+    signal: ok
+    expect: { health: healthy, failures: 0 }
+  - name: tripped_ok_becomes_healthy
+    current: { health: tripped, since: "2026-10-17T00:00:00Z" }
+    signal: ok
+    expect: { health: healthy, failures: 0 }
+  - name: probing_fail_stays_probing
+    current: { health: probing }
+    signal: fail
+    expect: { health: probing }
+  - name: healthy_ok_resets_counter
+    current: { health: healthy, failures: 2 }
+    signal: ok
+    expect: { health: healthy, failures: 0 }
+  - name: healthy_fail_increments_below_threshold
+    current: { health: healthy, failures: 0 }
+    signal: fail
+    expect: { health: healthy, failures: 1 }
+  - name: healthy_fail_increments_below_threshold_2
+    current: { health: healthy, failures: 1 }
+    signal: fail
+    expect: { health: healthy, failures: 2 }
+  - name: healthy_fail_trips_at_threshold
+    current: { health: healthy, failures: 2 }
+    signal: fail
+    expect: { health: tripped, note: "n+1=3 >= 阈值 3" }
+  - name: breaker_exempt_fail_unchanged
+    current: { health: healthy, failures: 2 }
+    signal: { kind: fail, breakerExempt: true }
+    expect: { health: healthy, failures: 2, note: "豁免失败不计数" }
+  - name: tripped_exempt_fail_unchanged
+    current: { health: tripped, since: "2026-10-17T00:00:00Z" }
+    signal: { kind: fail, breakerExempt: true }
+    expect: { health: tripped, note: "状态不变" }
+  - name: empty_outbound_fail_unchanged
+    current: { health: healthy, failures: 1 }
+    signal: { kind: fail, outboundEmpty: true }
+    expect: { health: healthy, failures: 1, note: "Outbound 为空时不计失败" }
+  - name: probing_exempt_fail_unchanged
+    current: { health: probing }
+    signal: { kind: fail, breakerExempt: true }
+    expect: { health: probing }
+notes:
+  - Ephemeral 驱逐不属于 Health，由调度器检查 Tripped.since + source.evictDelay 到期后从 Source 快照移除节点。
+  - Tripped 状态不接流量，但继续接受主动探测（ok 信号可将其拉回 Healthy）。

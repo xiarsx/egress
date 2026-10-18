@@ -1,0 +1,1039 @@
+openapi: 3.1.0
+info:
+  title: egress 控制面 API
+  version: 0.1.0
+  description: |
+    egress 控制面 API（spec-first：先改本文件并评审，再生成/修改代码）。
+
+    兼容性说明（相对 Resin 参考实现）：
+    - 路径前缀与资源路径保持兼容：`/api/v1/...`，如 `/api/v1/platforms`。
+    - `/api/v1/subscriptions` 更名为 `/api/v1/sources`（kind 名 Source）。
+    - `/api/v1/account-header-rules` 被 `/api/v1/identity-policies` 取代
+      （原 Platform 的反代字段与全局 Header 规则表收敛为 IdentityPolicy 资源）。
+    - Action 统一为 `POST <资源>/actions/<verb>` 形式，实现设计中的
+      `:refresh :probe :release :rebuild :apply` 约定。
+
+    统一约定：
+    - list / get / create / patch / delete；patch 为 merge-patch
+     （`Content-Type: application/merge-patch+json`）。
+    - 列表响应分页信封：`{items, total, limit, offset}`；
+      查询参数 `limit`（默认 50，最大 100000）、`offset`（默认 0）。
+    - 错误信封：`{error: {code, message}}`。
+    - 认证：`Authorization: Bearer <EGRESS_ADMIN_TOKEN>`；
+      未认证返回 401 `{error: {code: "UNAUTHORIZED"}}`。
+    - `GET /healthz` 无需认证。
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: 健康检查（公开）
+      security: []
+      responses:
+        '200':
+          description: 存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /api/v1/system/info:
+    get:
+      summary: 系统信息
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemInfo' }
+
+  /api/v1/system/config:
+    get:
+      summary: 读取运行时配置
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemConfig' }
+    patch:
+      summary: 修改运行时配置（merge-patch）
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/SystemConfig' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemConfig' }
+
+  /api/v1/system/config/default:
+    get:
+      summary: 默认配置
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemConfig' }
+
+  /api/v1/system/config/env:
+    get:
+      summary: 环境变量解析出的配置（EGRESS_ 前缀）
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object }
+
+  # ---- Platforms ----
+  /api/v1/platforms:
+    get:
+      summary: 列出 Platform
+      parameters: [ { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Offset' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformPage' }
+    post:
+      summary: 创建 Platform
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlatformInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Platform' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/platforms/preview-filter:
+    post:
+      summary: 预览过滤器匹配的节点（不落库）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { $ref: '#/components/schemas/PlatformFilter' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  matched: { type: integer }
+                  total: { type: integer }
+
+  /api/v1/platforms/{id}:
+    get:
+      summary: 获取 Platform
+      parameters: [ { $ref: '#/components/parameters/PlatformId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Platform' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: 修改 Platform（merge-patch）
+      parameters: [ { $ref: '#/components/parameters/PlatformId' } ]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/PlatformInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Platform' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除 Platform
+      parameters: [ { $ref: '#/components/parameters/PlatformId' } ]
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/platforms/{id}/actions/reset-to-default:
+    post:
+      summary: 重置 Platform 为默认配置
+      parameters: [ { $ref: '#/components/parameters/PlatformId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Platform' }
+
+  /api/v1/platforms/{id}/actions/rebuild-routable-view:
+    post:
+      summary: 重建该 Platform 的可路由 View（:rebuild）
+      parameters: [ { $ref: '#/components/parameters/PlatformId' } ]
+      responses:
+        '202': { description: 已接受 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Leases（挂在 Platform 下，与参考实现一致） ----
+  /api/v1/platforms/{id}/leases:
+    get:
+      summary: 列出该 Platform 的租约
+      parameters: [ { $ref: '#/components/parameters/PlatformId' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Offset' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LeasePage' }
+    delete:
+      summary: 删除该 Platform 的全部租约
+      parameters: [ { $ref: '#/components/parameters/PlatformId' } ]
+      responses:
+        '204': { description: 已删除 }
+
+  /api/v1/platforms/{id}/leases/{account}:
+    get:
+      summary: 获取单个租约
+      parameters: [ { $ref: '#/components/parameters/PlatformId' }, { $ref: '#/components/parameters/Account' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Lease' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 释放单个租约（:release）
+      parameters: [ { $ref: '#/components/parameters/PlatformId' }, { $ref: '#/components/parameters/Account' } ]
+      responses:
+        '204': { description: 已释放 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/platforms/{id}/ip-load:
+    get:
+      summary: 该 Platform 的 IPLoad（IP → 租约数）
+      parameters: [ { $ref: '#/components/parameters/PlatformId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { type: integer }
+
+  # ---- IdentityPolicies ----
+  /api/v1/identity-policies:
+    get:
+      summary: 列出 IdentityPolicy
+      parameters: [ { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Offset' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdentityPolicyPage' }
+    post:
+      summary: 创建 IdentityPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IdentityPolicyInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdentityPolicy' }
+
+  /api/v1/identity-policies/{name}:
+    get:
+      summary: 获取 IdentityPolicy
+      parameters: [ { $ref: '#/components/parameters/PolicyName' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdentityPolicy' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: 修改 IdentityPolicy（merge-patch）
+      parameters: [ { $ref: '#/components/parameters/PolicyName' } ]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/IdentityPolicyInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdentityPolicy' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除 IdentityPolicy（被引用的策略拒绝删除，409）
+      parameters: [ { $ref: '#/components/parameters/PolicyName' } ]
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---- Sources（参考实现中的 subscriptions 更名） ----
+  /api/v1/sources:
+    get:
+      summary: 列出 Source
+      parameters: [ { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Offset' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SourcePage' }
+    post:
+      summary: 创建 Source
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Source' }
+
+  /api/v1/sources/{id}:
+    get:
+      summary: 获取 Source
+      parameters: [ { $ref: '#/components/parameters/SourceId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Source' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: 修改 Source（merge-patch；改名/启用/禁用/更新都只是触发一次快照重发）
+      parameters: [ { $ref: '#/components/parameters/SourceId' } ]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/SourceInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Source' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除 Source
+      parameters: [ { $ref: '#/components/parameters/SourceId' } ]
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/sources/{id}/actions/refresh:
+    post:
+      summary: 立即刷新该 Source（:refresh）
+      parameters: [ { $ref: '#/components/parameters/SourceId' } ]
+      responses:
+        '202': { description: 已接受 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Recipes ----
+  /api/v1/recipes:
+    get:
+      summary: 列出 Recipe
+      parameters: [ { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Offset' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecipePage' }
+    post:
+      summary: 导入 Recipe（创建或更新）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Recipe' }
+          application/yaml:
+            schema: { $ref: '#/components/schemas/Recipe' }
+      responses:
+        '201':
+          description: 已导入
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /api/v1/recipes/{name}:
+    get:
+      summary: 获取 Recipe
+      parameters: [ { $ref: '#/components/parameters/RecipeName' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除 Recipe
+      parameters: [ { $ref: '#/components/parameters/RecipeName' } ]
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/recipes/{name}/actions/apply:
+    post:
+      summary: 应用 Recipe 为 Platform + IdentityPolicy（:apply）
+      parameters: [ { $ref: '#/components/parameters/RecipeName' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform]
+              properties:
+                platform: { type: string, description: 目标 Platform 名 }
+      responses:
+        '200':
+          description: 已应用
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  platform: { $ref: '#/components/schemas/Platform' }
+                  identityPolicy: { $ref: '#/components/schemas/IdentityPolicy' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  # ---- Nodes ----
+  /api/v1/nodes:
+    get:
+      summary: 列出节点
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: health
+          in: query
+          schema: { type: string, enum: [probing, healthy, tripped] }
+          description: 按健康状态过滤
+        - name: platform
+          in: query
+          schema: { type: string }
+          description: 只看某 Platform 可路由集合中的节点
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodePage' }
+
+  /api/v1/nodes/{hash}:
+    get:
+      summary: 获取单个节点
+      parameters: [ { $ref: '#/components/parameters/NodeHash' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/nodes/{hash}/actions/probe-egress:
+    post:
+      summary: 触发该节点的出口探测（:probe）
+      parameters: [ { $ref: '#/components/parameters/NodeHash' } ]
+      responses:
+        '202': { description: 已接受 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/nodes/{hash}/actions/probe-latency:
+    post:
+      summary: 触发该节点的延迟探测（:probe）
+      parameters: [ { $ref: '#/components/parameters/NodeHash' } ]
+      responses:
+        '202': { description: 已接受 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Endpoints ----
+  /api/v1/endpoints:
+    get:
+      summary: 列出 Endpoint
+      parameters: [ { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Offset' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointPage' }
+    post:
+      summary: 创建 Endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EndpointInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Endpoint' }
+
+  /api/v1/endpoints/{id}:
+    get:
+      summary: 获取 Endpoint
+      parameters: [ { $ref: '#/components/parameters/EndpointId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Endpoint' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: 修改 Endpoint（merge-patch）
+      parameters: [ { $ref: '#/components/parameters/EndpointId' } ]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/EndpointInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Endpoint' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除 Endpoint
+      parameters: [ { $ref: '#/components/parameters/EndpointId' } ]
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Request logs ----
+  /api/v1/request-logs:
+    get:
+      summary: 查询请求日志
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: platform
+          in: query
+          schema: { type: string }
+        - name: account
+          in: query
+          schema: { type: string }
+        - name: resin_error
+          in: query
+          schema: { type: string }
+          description: 按 X-Resin-Error 码过滤
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestLogPage' }
+
+  /api/v1/request-logs/{log_id}:
+    get:
+      summary: 获取单条请求日志
+      parameters: [ { $ref: '#/components/parameters/LogId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestLogEntry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/request-logs/{log_id}/payloads:
+    get:
+      summary: 获取请求日志的 payload（需开启 payload 抓取开关）
+      parameters: [ { $ref: '#/components/parameters/LogId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---- Metrics ----
+  /api/v1/metrics/realtime/throughput:
+    get:
+      summary: 实时吞吐曲线（内存 ring buffer）
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/realtime/connections:
+    get:
+      summary: 实时连接数曲线
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/realtime/leases:
+    get:
+      summary: 实时租约数曲线
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/history/traffic:
+    get:
+      summary: 历史流量（小时桶）
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/history/requests:
+    get:
+      summary: 历史请求数与成功率
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/history/access-latency:
+    get:
+      summary: 历史访问延迟分布
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/history/probes:
+    get:
+      summary: 历史探测次数
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/history/node-pool:
+    get:
+      summary: 历史节点池规模
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/history/lease-lifetime:
+    get:
+      summary: 历史租约存活分布
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/snapshots/node-pool:
+    get:
+      summary: 节点池快照
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/snapshots/platform-node-pool:
+    get:
+      summary: 各平台节点池快照
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/metrics/snapshots/node-latency-distribution:
+    get:
+      summary: 节点延迟分布快照
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+
+  # ---- GeoIP ----
+  /api/v1/geoip/status:
+    get:
+      summary: GeoIP 库状态
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/geoip/lookup:
+    get:
+      summary: 查 IP 的 Geo 信息
+      parameters:
+        - name: ip
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+    post:
+      summary: 批量查 IP 的 Geo 信息
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ips: { type: array, items: { type: string } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+  /api/v1/geoip/actions/update-now:
+    post:
+      summary: 立即更新 GeoIP 库
+      responses:
+        '202': { description: 已接受 }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: EGRESS_ADMIN_TOKEN
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 0, maximum: 100000, default: 50 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    PlatformId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Platform ID（UUID）
+    Account:
+      name: account
+      in: path
+      required: true
+      schema: { type: string }
+    PolicyName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+    SourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    RecipeName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+    NodeHash:
+      name: hash
+      in: path
+      required: true
+      schema: { type: string }
+    EndpointId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    LogId:
+      name: log_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: 请求非法
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: 不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: 冲突（重名 / 被引用）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: 语义错误（如 Recipe requires 不满足）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: NOT_FOUND }
+            message: { type: string }
+
+    PlatformFilter:
+      type: object
+      properties:
+        tags:
+          type: array
+          items: { type: string }
+          description: 标签过滤；无前缀=ANY，*=MUST，!=MUST_NOT
+        attrs:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              in: { type: array, items: { type: string } }
+              notIn: { type: array, items: { type: string } }
+              match: { type: string }
+              notMatch: { type: string }
+              gte: { type: number }
+              lte: { type: number }
+          description: 属性过滤；key 未定义视为不匹配，notIn/notMatch 视为通过
+
+    Platform:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        sticky_ttl: { type: string, example: 168h, description: 租约 TTL（ISO/Go duration 文本） }
+        allocation: { type: string, enum: [BALANCED, PREFER_LOW_LATENCY, PREFER_IDLE_IP] }
+        passive_breaker: { type: string, enum: [on, off] }
+        identity_policy: { type: string, description: 引用的 IdentityPolicy 名 }
+        filter: { $ref: '#/components/schemas/PlatformFilter' }
+        updated_at_ns: { type: integer }
+    PlatformInput:
+      type: object
+      properties:
+        name: { type: string }
+        sticky_ttl: { type: string }
+        allocation: { type: string, enum: [BALANCED, PREFER_LOW_LATENCY, PREFER_IDLE_IP] }
+        passive_breaker: { type: string, enum: [on, off] }
+        identity_policy: { type: string }
+        filter: { $ref: '#/components/schemas/PlatformFilter' }
+    PlatformPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Platform' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    IdentityPolicyStep:
+      type: object
+      properties:
+        header: { type: string, description: 从该请求头取值（SOCKS5 跳过） }
+        wire: { type: object, description: 取线协议身份串中的 Account }
+        headerRule:
+          type: object
+          properties:
+            rules:
+              type: array
+              items:
+                type: object
+                required: [prefix, headers]
+                properties:
+                  prefix: { type: string }
+                  headers: { type: array, items: { type: string } }
+    IdentityPolicy:
+      type: object
+      properties:
+        name: { type: string }
+        chain: { type: array, items: { $ref: '#/components/schemas/IdentityPolicyStep' } }
+        on_miss: { type: string, enum: [random, reject] }
+        updated_at_ns: { type: integer }
+    IdentityPolicyInput:
+      type: object
+      properties:
+        name: { type: string }
+        chain: { type: array, items: { $ref: '#/components/schemas/IdentityPolicyStep' } }
+        on_miss: { type: string, enum: [random, reject] }
+    IdentityPolicyPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/IdentityPolicy' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    Source:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [remote, local] }
+        url: { type: string }
+        update_interval: { type: string, example: 5m }
+        enabled: { type: boolean }
+        ephemeral: { type: boolean }
+        evict_delay: { type: string }
+        last_error: { type: string, description: 上次同步错误（运行时状态） }
+        created_at_ns: { type: integer }
+        updated_at_ns: { type: integer }
+    SourceInput:
+      type: object
+      properties:
+        name: { type: string }
+        type: { type: string, enum: [remote, local] }
+        url: { type: string }
+        content: { type: string, description: type=local 时的内联订阅内容 }
+        update_interval: { type: string }
+        enabled: { type: boolean }
+        ephemeral: { type: boolean }
+        evict_delay: { type: string }
+    SourcePage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Source' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    Recipe:
+      type: object
+      properties:
+        api_version: { type: string, example: egress/v1 }
+        name: { type: string }
+        version: { type: string }
+        requires: { type: array, items: { type: string } }
+        identity_policy: { $ref: '#/components/schemas/IdentityPolicyInput' }
+        platform_template: { $ref: '#/components/schemas/PlatformInput' }
+    RecipePage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Recipe' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    Node:
+      type: object
+      properties:
+        hash: { type: string, description: 规范化配置的 xxh3-128 }
+        tags: { type: array, items: { type: string }, description: ScopedTag "<sourceName>/<rawTag>" }
+        attrs: { type: object, additionalProperties: true, description: 命名空间属性快照 }
+        egress_ip: { type: string }
+        health: { type: string, enum: [probing, healthy, tripped] }
+        failures: { type: integer, description: healthy 下的连续失败计数 }
+        tripped_since_ns: { type: integer }
+    NodePage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Node' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    Lease:
+      type: object
+      properties:
+        platform_id: { type: string }
+        account: { type: string }
+        egress_ip: { type: string, description: 锚点 }
+        node_hash: { type: string, description: nodeHint（缓存，可换同 IP 节点） }
+        expiry_ns: { type: integer, description: 固定过期时间，不续期 }
+        last_accessed_ns: { type: integer }
+    LeasePage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Lease' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    Endpoint:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        port: { type: integer }
+        enabled: { type: boolean }
+        allow_management: { type: boolean }
+        allow_proxy: { type: boolean }
+        require_proxy_auth_info: { type: boolean }
+        allow_http_forward: { type: boolean }
+        allow_http_reverse: { type: boolean }
+        allow_socks5: { type: boolean }
+        created_at_ns: { type: integer }
+        updated_at_ns: { type: integer }
+    EndpointInput:
+      type: object
+      properties:
+        name: { type: string }
+        port: { type: integer }
+        enabled: { type: boolean }
+        allow_management: { type: boolean }
+        allow_proxy: { type: boolean }
+        require_proxy_auth_info: { type: boolean }
+        allow_http_forward: { type: boolean }
+        allow_http_reverse: { type: boolean }
+        allow_socks5: { type: boolean }
+    EndpointPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Endpoint' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    RequestLogEntry:
+      type: object
+      properties:
+        ts_ns: { type: integer }
+        proxy_type: { type: string, enum: [http-forward, reverse, socks5-forward] }
+        platform: { type: string }
+        account: { type: string }
+        target: { type: string }
+        node: { type: string }
+        egress_ip: { type: string }
+        net_ok: { type: boolean }
+        http_status: { type: integer }
+        stage: { type: string }
+        resin_error: { type: string }
+        duration_ms: { type: integer }
+        bytes_up: { type: integer }
+        bytes_down: { type: integer }
+    RequestLogPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/RequestLogEntry' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    SystemInfo:
+      type: object
+      properties:
+        version: { type: string }
+        uptime_ns: { type: integer }
+    SystemConfig:
+      type: object
+      description: 运行时配置（除启动期必需环境变量外，其余皆为声明式资源）
+      properties:
+        listen_address: { type: string }
+        port: { type: integer }
+        state_dir: { type: string }
+        cache_dir: { type: string }
+        log_dir: { type: string }

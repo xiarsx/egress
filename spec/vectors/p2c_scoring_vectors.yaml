@@ -1,0 +1,59 @@
+# P2C 打分 conformance 向量
+# 来源：设计 §7.2。
+# 规则：
+# - 只有两个候选都有"同口径延迟"时才比较延迟：先看目标域名延迟，再看共同 Authority 均值；
+#   否则 score = leaseCount（只比租约数）。
+# - BALANCED: score = (leaseCount+1) * latency
+# - PREFER_LOW_LATENCY: score = latency
+# - PREFER_IDLE_IP: score = leaseCount
+# - 取分低者。打平时的行为未在设计中规定（建议实现采用确定性规则，如 hash 小者胜），本向量不覆盖。
+version: 1
+vectors:
+  - name: balanced_prefers_lower_product
+    allocation: BALANCED
+    target: "example.com"
+    candidates:
+      - { id: A, leaseCount: 2, latencyMs: 50, latencyKind: target_domain }
+      - { id: B, leaseCount: 5, latencyMs: 20, latencyKind: target_domain }
+    scores: { A: 150, B: 120 }
+    expect: B
+  - name: balanced_no_latency_falls_back_to_lease_count
+    allocation: BALANCED
+    target: "example.com"
+    candidates:
+      - { id: A, leaseCount: 2, latencyMs: null }
+      - { id: B, leaseCount: 5, latencyMs: 20, latencyKind: target_domain }
+    note: "B 有延迟、A 没有：口径不一致，不比较延迟，只比 leaseCount"
+    expect: A
+  - name: balanced_common_authority_mean
+    allocation: BALANCED
+    target: "other.example"
+    candidates:
+      - { id: A, leaseCount: 0, latencyMs: 100, latencyKind: common_authority_mean }
+      - { id: B, leaseCount: 0, latencyMs: 40, latencyKind: common_authority_mean }
+    scores: { A: 100, B: 40 }
+    expect: B
+  - name: prefer_low_latency_ignores_lease_count
+    allocation: PREFER_LOW_LATENCY
+    target: "example.com"
+    candidates:
+      - { id: A, leaseCount: 0, latencyMs: 50, latencyKind: target_domain }
+      - { id: B, leaseCount: 9, latencyMs: 20, latencyKind: target_domain }
+    scores: { A: 50, B: 20 }
+    expect: B
+  - name: prefer_idle_ip_ignores_latency
+    allocation: PREFER_IDLE_IP
+    target: "example.com"
+    candidates:
+      - { id: A, leaseCount: 2, latencyMs: 50, latencyKind: target_domain }
+      - { id: B, leaseCount: 5, latencyMs: 20, latencyKind: target_domain }
+    scores: { A: 2, B: 5 }
+    expect: A
+  - name: mixed_latency_kind_falls_back_to_lease_count
+    allocation: BALANCED
+    target: "example.com"
+    candidates:
+      - { id: A, leaseCount: 3, latencyMs: 30, latencyKind: target_domain }
+      - { id: B, leaseCount: 1, latencyMs: 200, latencyKind: common_authority_mean }
+    note: "口径不一致（目标域名 vs 共同 Authority 均值）：不比较延迟，只比 leaseCount"
+    expect: B

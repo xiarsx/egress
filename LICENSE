@@ -1,0 +1,35 @@
+MIT License
+
+Copyright (c) 2026 xiarsx and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## 署名说明 / Attribution
+
+本项目（egress）参考并衍生自 Resin（Copyright (c) 2026 Resinat and
+contributors，MIT License），保留原项目署名。Resin 的设计文档、身份线协议
+V1、错误契约与控制面 API 路径是 egress 兼容性契约的来源，见 `spec/`。
+
+This project (egress) references and is derived from Resin
+(Copyright (c) 2026 Resinat and contributors, MIT License); the original
+attribution is retained. Resin's design documents, identity wire protocol V1,
+error contract, and control-plane API paths are the source of egress's
+compatibility contract; see `spec/`.

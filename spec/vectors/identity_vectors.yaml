@@ -1,0 +1,159 @@
+# 身份解析 conformance 向量（身份线协议 V1）
+# 语义见 ../identity.md §2。空 platform 表示"用 Default"；空 account 表示"随机路由，不建租约"。
+# 来源：参考实现 internal/proxy/identity_v1.go 的单元测试与 DESIGN.md 例子表。
+version: 1
+vectors:
+
+  # --- 正向代理 user:pass 整体（先按最右 ":" 切 Token） ---
+  - name: forward_basic_full
+    entry: http-forward
+    credential: "Nimbus.Tom:resin-123456"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "Tom" }
+  - name: forward_basic_empty_platform
+    entry: http-forward
+    credential: ".Tom:resin-123456"
+    expect: { token: "resin-123456", platform: "", account: "Tom" }
+  - name: forward_basic_empty_account
+    entry: http-forward
+    credential: "Nimbus:resin-123456"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "" }
+  - name: forward_basic_trailing_dot
+    entry: http-forward
+    credential: "Nimbus.:resin-123456"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "" }
+  - name: forward_basic_account_with_colon
+    entry: http-forward
+    credential: "MyHub.bEA:234:resin-123456"
+    expect: { token: "resin-123456", platform: "MyHub", account: "bEA:234" }
+  - name: forward_credential_empty
+    entry: http-forward
+    credential: ""
+    expect: { token: "", platform: "", account: "" }
+  - name: forward_credential_bare_platform
+    entry: http-forward
+    credential: "a"
+    expect: { token: "", platform: "a", account: "" }
+  - name: forward_credential_lone_colon
+    entry: http-forward
+    credential: ":"
+    expect: { token: "", platform: "", account: "" }
+  - name: forward_credential_dot_colon
+    entry: http-forward
+    credential: ".:"
+    expect: { token: "", platform: "", account: "" }
+  - name: forward_credential_colon_dot
+    entry: http-forward
+    credential: ":."
+    expect: { token: ".", platform: "", account: "" }
+  - name: forward_credential_dot_b_colon
+    entry: http-forward
+    credential: ".b:"
+    expect: { token: "", platform: "", account: "b" }
+  - name: forward_credential_dot_colon_c
+    entry: http-forward
+    credential: ".:c"
+    expect: { token: "c", platform: "", account: "" }
+  - name: forward_credential_double_colon
+    entry: http-forward
+    credential: ".::c"
+    expect: { token: "c", platform: "", account: ":" }
+  - name: forward_credential_double_dot
+    entry: http-forward
+    credential: "..:"
+    expect: { token: "", platform: "", account: "." }
+  - name: forward_credential_a_dot_b_colon_c
+    entry: http-forward
+    credential: "a.b:c"
+    expect: { token: "c", platform: "a", account: "b" }
+
+  # --- 纯身份串切分（无 Token 参与；反向代理身份段解码后走此规则） ---
+  - name: identity_empty
+    entry: identity-only
+    identity: ""
+    expect: { platform: "", account: "" }
+  - name: identity_lone_colon
+    entry: identity-only
+    identity: ":"
+    expect: { platform: "", account: "" }
+  - name: identity_lone_dot
+    entry: identity-only
+    identity: "."
+    expect: { platform: "", account: "" }
+  - name: identity_bare
+    entry: identity-only
+    identity: "a"
+    expect: { platform: "a", account: "" }
+  - name: identity_trailing_colon
+    entry: identity-only
+    identity: "a:"
+    expect: { platform: "a", account: "" }
+  - name: identity_leading_colon
+    entry: identity-only
+    identity: ":b"
+    expect: { platform: "", account: "b" }
+  - name: identity_dot_colon
+    entry: identity-only
+    identity: ".:"
+    expect: { platform: "", account: ":" }
+  - name: identity_colon_dot
+    entry: identity-only
+    identity: ":."
+    expect: { platform: "", account: "." }
+  - name: identity_colon_dotdot
+    entry: identity-only
+    identity: ":.."
+    expect: { platform: "", account: ".." }
+  - name: identity_colon_split
+    entry: identity-only
+    identity: "a:b"
+    expect: { platform: "a", account: "b" }
+  - name: identity_first_dot_wins_over_later_colon
+    entry: identity-only
+    identity: "MyHub.ops:prod"
+    expect: { platform: "MyHub", account: "ops:prod" }
+
+  # --- SOCKS5 RFC1929（username=身份串，password=Token；无最右切分，整串即身份） ---
+  - name: socks5_full
+    entry: socks5
+    method: "0x02"
+    username: "Nimbus.Tom"
+    password: "resin-123456"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "Tom" }
+  - name: socks5_empty_account
+    entry: socks5
+    method: "0x02"
+    username: "Nimbus"
+    password: "resin-123456"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "" }
+  - name: socks5_account_with_colon
+    entry: socks5
+    method: "0x02"
+    username: "MyHub.bEA:234"
+    password: "resin-123456"
+    expect: { token: "resin-123456", platform: "MyHub", account: "bEA:234" }
+
+  # --- 反向代理路径（/TOKEN/identity/proto/host/...；身份段先 Path Segment 解码） ---
+  - name: reverse_full
+    entry: reverse
+    path: "/resin-123456/Nimbus.Tom/https/example.com/p"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "Tom", proto: "https", host: "example.com" }
+  - name: reverse_empty_platform
+    entry: reverse
+    path: "/resin-123456/.Tom/https/example.com/p"
+    expect: { token: "resin-123456", platform: "", account: "Tom", proto: "https", host: "example.com" }
+  - name: reverse_empty_account
+    entry: reverse
+    path: "/resin-123456/Nimbus/https/example.com/p"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "", proto: "https", host: "example.com" }
+  - name: reverse_trailing_dot
+    entry: reverse
+    path: "/resin-123456/Nimbus./https/example.com/p"
+    expect: { token: "resin-123456", platform: "Nimbus", account: "", proto: "https", host: "example.com" }
+  - name: reverse_account_with_colon
+    entry: reverse
+    path: "/resin-123456/MyHub.bEA:234/https/example.com/p"
+    expect: { token: "resin-123456", platform: "MyHub", account: "bEA:234", proto: "https", host: "example.com" }
+  - name: reverse_percent_encoded_identity
+    entry: reverse
+    path: "/resin-123456/MyHub.ops%2Fprod%3Feu%231/https/example.com/p"
+    expect: { token: "resin-123456", platform: "MyHub", account: "ops/prod?eu#1", proto: "https", host: "example.com" }
