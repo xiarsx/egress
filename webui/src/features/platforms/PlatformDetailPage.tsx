@@ -139,11 +139,15 @@ export function PlatformDetailPage() {
     editForm.reset(platformToFormValues(platform));
   }, [platform, editForm]);
 
-  useEffect(() => {
+  // platformId 变化时在渲染期间重置租约分页/搜索（React 推荐的
+  // adjust-state-during-render，替代 effect 里的同步 setState）。
+  const [prevPlatformId, setPrevPlatformId] = useState(platformId);
+  if (prevPlatformId !== platformId) {
+    setPrevPlatformId(platformId);
     setLeasePage(0);
     setLeaseSearch("");
     setDebouncedLeaseSearch("");
-  }, [platformId]);
+  }
 
   useEffect(() => {
     const timeoutID = window.setTimeout(() => {
@@ -153,19 +157,23 @@ export function PlatformDetailPage() {
     return () => window.clearTimeout(timeoutID);
   }, [leaseSearch]);
 
-  useEffect(() => {
-    const maxPage = Math.max(0, Math.ceil(leasesPage.total / leasePageSize) - 1);
-    if (leasePage > maxPage) {
-      setLeasePage(maxPage);
-    }
-  }, [leasePage, leasePageSize, leasesPage.total]);
+  // 租约总数变化导致当前页越界时，渲染期间直接钳回最大页。
+  const maxLeasePage = Math.max(0, Math.ceil(leasesPage.total / leasePageSize) - 1);
+  if (leasePage > maxLeasePage) {
+    setLeasePage(maxLeasePage);
+  }
 
-  useEffect(() => {
+  // URL 指定 tab=ops 或租约锚点时同步激活 ops 页签（随 location 变化在
+  // 渲染期间调整一次）。
+  const locationKey = location.search + location.hash;
+  const [prevLocationKey, setPrevLocationKey] = useState(locationKey);
+  if (prevLocationKey !== locationKey) {
+    setPrevLocationKey(locationKey);
     const tab = new URLSearchParams(location.search).get("tab");
     if (tab === "ops" || location.hash === `#${LEASE_MANAGEMENT_ANCHOR}`) {
       setActiveTab("ops");
     }
-  }, [location.hash, location.search]);
+  }
 
   useEffect(() => {
     if (activeTab !== "ops" || location.hash !== `#${LEASE_MANAGEMENT_ANCHOR}`) {

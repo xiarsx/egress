@@ -23,10 +23,14 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"errors"
+	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xiarsx/egress/internal/core/identity"
@@ -34,6 +38,7 @@ import (
 	pick "github.com/xiarsx/egress/internal/core/select"
 	"github.com/xiarsx/egress/internal/core/view"
 	"github.com/xiarsx/egress/internal/ports"
+	"github.com/xiarsx/egress/pkg/ext"
 	pklease "github.com/xiarsx/egress/pkg/lease"
 	pknode "github.com/xiarsx/egress/pkg/node"
 	pksignal "github.com/xiarsx/egress/pkg/signal"
@@ -46,7 +51,7 @@ const (
 	ProtoHTTPReverse = "http-reverse"
 )
 
-// X-Resin-Error codes (spec/errors.md §1). CodeClientCanceled is a
+// X-Egress-Error codes (spec/errors.md §1). CodeClientCanceled is a
 // pipeline-internal extension, not part of the spec enum: it means the
 // downstream client went away mid-flight, so adapters must close the
 // connection silently instead of writing an error response.
@@ -64,6 +69,9 @@ const (
 	CodeUpstreamRequestFailed = "UPSTREAM_REQUEST_FAILED"
 	CodeInternalError         = "INTERNAL_ERROR"
 	CodeClientCanceled        = "CLIENT_CANCELED"
+	// CodeCapabilityDisabled is returned when the addressed endpoint does
+	// not allow the requested ingress kind (spec/errors.md §1.5).
+	CodeCapabilityDisabled = "ENDPOINT_CAPABILITY_DISABLED"
 )
 
 // ProxyError is a classified proxy failure. A nil *ProxyError means
@@ -75,7 +83,30 @@ type ProxyError struct {
 
 func (e *ProxyError) Error() string { return "pipeline: " + e.Code + ": " + e.Msg }
 
-// HTTPStatus maps an X-Resin-Error code to its HTTP status (spec/errors.md
+// WriteHTTPError writes the spec/errors.md §1 HTTP error response for
+// handler-based ingress (forward/reverse/endpoint mux): X-Egress-Error
+// header, text/plain body, Proxy-Authenticate on 407.
+// CodeClientCanceled is silent: the client is already gone.
+func WriteHTTPError(w http.ResponseWriter, perr *ProxyError) {
+	if perr == nil || perr.Code == CodeClientCanceled {
+		return
+	}
+	status := HTTPStatus(perr.Code)
+	h := w.Header()
+	h.Set("X-Egress-Error", perr.Code)
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	if perr.Code == CodeAuthRequired {
+		h.Set("Proxy-Authenticate", `Basic realm="egress"`)
+	}
+	msg := perr.Msg
+	if msg == "" {
+		msg = perr.Code
+	}
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, msg)
+}
+
+// HTTPStatus maps an X-Egress-Error code to its HTTP status (spec/errors.md
 // §1). Unknown codes map to 500.
 func HTTPStatus(code string) int {
 	switch code {
@@ -89,6 +120,8 @@ func HTTPStatus(code string) int {
 		return 404
 	case CodeNoAvailableNodes:
 		return 503
+	case CodeCapabilityDisabled:
+		return 403
 	case CodeUpstreamConnectFailed, CodeUpstreamRequestFailed:
 		return 502
 	case CodeUpstreamTimeout:
@@ -153,7 +186,10 @@ type Deps struct {
 	Latency func(h pknode.Hash, domain string) (time.Duration, bool)
 	IPLoad  func(platformID string, ip netip.Addr) int64
 
-	PickPolicy pick.Policy
+	// PickPolicyFor returns the selection policy for one platform
+	// (per-platform allocation and sticky TTL). Nil ⇒ built-in default
+	// (BALANCED, pick.DefaultStickyTTL, no authority comparison).
+	PickPolicyFor func(platformID string) pick.Policy
 	// Bypass reports whether target ("host:port") goes direct.
 	Bypass func(target string) bool
 	Rand   *rand.Rand // *math/rand/v2; guarded internally
@@ -165,6 +201,18 @@ type Deps struct {
 	// breaker; such platforms' traffic is emitted with BreakerExempt.
 	// Nil means the breaker is on for every platform.
 	PassiveBreakerOff func(platformID string) bool
+
+	// ReqLog consumes the terminal RequestLogRecord of every request
+	// (spec/events.md §2), exactly once per request, success or failure.
+	// Client-canceled requests produce no record. Must be non-blocking
+	// (bounded staging, shed on full); nil disables logging.
+	// Adapter-level rejections before the pipeline runs (e.g. reverse-path
+	// URL_PARSE_ERROR) are out of scope.
+	ReqLog func(rec ports.RequestLogRecord)
+
+	// ActiveSessions, when non-nil, is incremented while a relay runs and
+	// decremented when it ends (realtime connections metrics).
+	ActiveSessions *atomic.Int64
 }
 
 // Pipeline is the Resolve → Route → Dial → Relay chain.
@@ -221,13 +269,22 @@ type Prepared struct {
 	Upstream net.Conn
 	Head     []byte
 
+	// headWritten/headUp record a WriteHead already done by the adapter
+	// (plain-request adapters write the head BEFORE hijacking the client
+	// so a failure is still mappable to an HTTP error response).
+	headWritten bool
+	headUp      int64
+
 	NodeHash      pknode.Hash // zero for direct/bypass
 	PlatformID    string
+	platform      string // wire name, mirrors resolved.platform
 	Direct        bool
 	HasTLS        bool
 	TLSHandshake  time.Duration
 	BreakerExempt bool
 	startedAt     time.Time
+	egressIP      netip.Addr
+	account       string
 }
 
 // Handle runs the full flow: Resolve → Route → Dial → Relay, then emits
@@ -238,7 +295,7 @@ func (p *Pipeline) Handle(ctx context.Context, client net.Conn, req Request) *Pr
 	if perr != nil {
 		return perr
 	}
-	return p.Relay(ctx, prep, client)
+	return p.Relay(ctx, prep, client, req)
 }
 
 // Prepare runs Resolve → Route → Dial and returns the dialed upstream
@@ -248,20 +305,25 @@ func (p *Pipeline) Handle(ctx context.Context, client net.Conn, req Request) *Pr
 // (spec/errors.md §2–§3). On dial failure a fail Traffic signal is
 // emitted before returning.
 func (p *Pipeline) Prepare(ctx context.Context, req Request) (*Prepared, *ProxyError) {
+	start := p.d.Clock.Now()
 	r, perr := p.resolve(req)
 	if perr != nil {
+		p.logRequest(req, start, resolved{}, nil, false, "", perr, 0, 0)
 		return nil, perr
 	}
 	rt, perr := p.route(req, r)
 	if perr != nil {
+		p.logRequest(req, start, r, nil, false, "", perr, 0, 0)
 		return nil, perr
 	}
 	prep := &Prepared{
 		Head:          req.Head,
 		PlatformID:    r.platformID,
+		platform:      r.platform,
 		Direct:        rt.direct,
 		BreakerExempt: p.d.PassiveBreakerOff != nil && p.d.PassiveBreakerOff(r.platformID),
-		startedAt:     p.d.Clock.Now(),
+		startedAt:     start,
+		egressIP:      rt.node.EgressIP,
 	}
 	if !rt.direct {
 		prep.NodeHash = rt.node.Hash
@@ -270,9 +332,10 @@ func (p *Pipeline) Prepare(ctx context.Context, req Request) (*Prepared, *ProxyE
 	raw, perr := p.dialUpstream(ctx, req, rt)
 	if perr != nil {
 		// Client-initiated cancel is not a node failure and produces no
-		// signal (spec/errors.md §1.4).
+		// signal and no log record (spec/errors.md §1.4).
 		if perr.Code != CodeClientCanceled {
 			p.emit(prep, false, 0, 0, 0, false)
+			p.logRequest(req, start, r, prep, false, "dial", perr, 0, 0)
 		}
 		return nil, perr
 	}
@@ -289,39 +352,70 @@ func (p *Pipeline) Prepare(ctx context.Context, req Request) (*Prepared, *ProxyE
 			}
 			p.emit(prep, false, 0, 0, 0, false)
 			if isTimeoutErr(herr) {
-				return nil, &ProxyError{Code: CodeUpstreamTimeout, Msg: "TLS handshake timed out: " + herr.Error()}
+				perr = &ProxyError{Code: CodeUpstreamTimeout, Msg: "TLS handshake timed out: " + herr.Error()}
+			} else {
+				perr = &ProxyError{Code: CodeUpstreamRequestFailed, Msg: "TLS handshake failed: " + herr.Error()}
 			}
-			return nil, &ProxyError{Code: CodeUpstreamRequestFailed, Msg: "TLS handshake failed: " + herr.Error()}
+			p.logRequest(req, start, r, prep, false, "tls", perr, 0, 0)
+			return nil, perr
 		}
 		prep.HasTLS = true
 		prep.TLSHandshake = tc.latency()
 		up = tlsConn
 	}
 	prep.Upstream = up
+	prep.account = r.account
 	return prep, nil
+}
+
+// WriteHead writes the prepared head bytes upstream (plain-request
+// adapters call this BEFORE hijacking the client connection so a failure
+// is still mappable to a spec/errors.md HTTP response). It is idempotent
+// per Prepared: Relay skips the head when WriteHead already ran.
+func (p *Pipeline) WriteHead(ctx context.Context, prep *Prepared, req Request) (int64, *ProxyError) {
+	if prep.headWritten || len(prep.Head) == 0 {
+		return prep.headUp, nil
+	}
+	n, werr := writeFull(prep.Upstream, prep.Head)
+	upN := int64(n)
+	if werr == nil {
+		prep.headWritten, prep.headUp = true, upN
+		return upN, nil
+	}
+	werr = contextCause(ctx, werr)
+	if errors.Is(werr, context.Canceled) {
+		return upN, &ProxyError{Code: CodeClientCanceled, Msg: "client canceled during head write"}
+	}
+	p.emit(prep, false, upN, 0, prep.TLSHandshake, prep.HasTLS)
+	var perr *ProxyError
+	if isTimeoutErr(werr) {
+		perr = &ProxyError{Code: CodeUpstreamTimeout, Msg: "upstream write timed out: " + werr.Error()}
+	} else {
+		perr = &ProxyError{Code: CodeUpstreamRequestFailed, Msg: "upstream write failed: " + werr.Error()}
+	}
+	p.logPrepared(req, prep, false, "request", perr, upN, 0)
+	return upN, perr
 }
 
 // Relay writes the prepared head bytes, pumps both directions with byte
 // counting, and emits the Traffic signal. It closes the upstream
 // connection; the client connection stays open for the adapter to close.
-func (p *Pipeline) Relay(ctx context.Context, prep *Prepared, client net.Conn) *ProxyError {
+func (p *Pipeline) Relay(ctx context.Context, prep *Prepared, client net.Conn, req Request) *ProxyError {
+	if p.d.ActiveSessions != nil {
+		p.d.ActiveSessions.Add(1)
+		defer p.d.ActiveSessions.Add(-1)
+	}
 	up := prep.Upstream
 	defer func() { _ = up.Close() }()
 
 	var upN int64
-	if len(prep.Head) > 0 {
-		n, werr := writeFull(up, prep.Head)
-		upN = int64(n)
-		if werr != nil {
-			werr = contextCause(ctx, werr)
-			if errors.Is(werr, context.Canceled) {
-				return &ProxyError{Code: CodeClientCanceled, Msg: "client canceled during head write"}
-			}
-			p.emit(prep, false, upN, 0, prep.TLSHandshake, prep.HasTLS)
-			if isTimeoutErr(werr) {
-				return &ProxyError{Code: CodeUpstreamTimeout, Msg: "upstream write timed out: " + werr.Error()}
-			}
-			return &ProxyError{Code: CodeUpstreamRequestFailed, Msg: "upstream write failed: " + werr.Error()}
+	if prep.headWritten {
+		upN = prep.headUp
+	} else if len(prep.Head) > 0 {
+		n, perr := p.WriteHead(ctx, prep, req)
+		upN = n
+		if perr != nil {
+			return perr
 		}
 	}
 
@@ -329,14 +423,18 @@ func (p *Pipeline) Relay(ctx context.Context, prep *Prepared, client net.Conn) *
 	upN += upExtra
 	p.emit(prep, clean, upN, downN, prep.TLSHandshake, prep.HasTLS)
 	if !clean {
-		return &ProxyError{Code: CodeUpstreamRequestFailed, Msg: "relay failed"}
+		perr := &ProxyError{Code: CodeUpstreamRequestFailed, Msg: "relay failed"}
+		p.logPrepared(req, prep, false, "tunnel", perr, upN, downN)
+		return perr
 	}
+	p.logPrepared(req, prep, true, "", nil, upN, downN)
 	return nil
 }
 
 // --- Resolve ---
 
 type resolved struct {
+	platform   string // wire name (identity prefix), for request logs
 	platformID string
 	account    string
 }
@@ -385,7 +483,7 @@ func (p *Pipeline) resolve(req Request) (resolved, *ProxyError) {
 	if !ok {
 		return resolved{}, &ProxyError{Code: CodeAccountRejected, Msg: "account rejected by platform policy"}
 	}
-	return resolved{platformID: platformID, account: account}, nil
+	return resolved{platform: id.PlatformID, platformID: platformID, account: account}, nil
 }
 
 // --- Route ---
@@ -433,6 +531,13 @@ func (p *Pipeline) route(req Request, r resolved) (routed, *ProxyError) {
 }
 
 func (p *Pipeline) selectNode(v *view.View, r resolved, l *pklease.Lease, req Request) (pick.Outcome, error) {
+	var pol pick.Policy
+	if p.d.PickPolicyFor != nil {
+		pol = p.d.PickPolicyFor(r.platformID)
+	}
+	if pol.SelectorName != "" {
+		return p.selectViaExt(v, r, req, pol.SelectorName)
+	}
 	return pick.Select(
 		v,
 		nodesFunc(p.d.Nodes),
@@ -440,11 +545,43 @@ func (p *Pipeline) selectNode(v *view.View, r resolved, l *pklease.Lease, req Re
 		latencyFunc(p.d.Latency),
 		r.account,
 		l,
-		p.d.PickPolicy,
+		pol,
 		hostOnly(req.Target),
 		p.d.Clock.Now(),
 		p.deriveRng(),
 	)
+}
+
+// selectViaExt routes the pick to a registered ext.Selector
+// (spec/ext-abi.md §2). Sticky leases are bypassed: the selector owns
+// stickiness. An unregistered name is a configuration error surfaced as
+// NO_AVAILABLE_NODES (fail-closed, never a silent fallback).
+func (p *Pipeline) selectViaExt(v *view.View, r resolved, req Request, name string) (pick.Outcome, error) {
+	sel, ok := ext.GetSelector(name)
+	if !ok {
+		return pick.Outcome{}, pick.ErrNoAvailableNodes
+	}
+	cands := make([]pknode.NodeSnapshot, 0, v.Size())
+	v.Range(func(h pknode.Hash) bool {
+		if snap, found := p.d.Nodes(h); found {
+			cands = append(cands, snap)
+		}
+		return true
+	})
+	if len(cands) == 0 {
+		return pick.Outcome{}, pick.ErrNoAvailableNodes
+	}
+	h := sel.Pick(cands, ext.SelectContext{Target: req.Target, PlatformID: r.platformID})
+	snap, found := p.d.Nodes(h)
+	if !found {
+		return pick.Outcome{}, pick.ErrNodeGone
+	}
+	if !v.Contains(h) {
+		// A selector returning a node outside its candidate list is a bug;
+		// refuse it rather than route around the platform view.
+		return pick.Outcome{}, fmt.Errorf("select: ext selector %q picked a node outside the view", name)
+	}
+	return pick.Outcome{Node: snap}, nil
 }
 
 // deriveRng mints a per-request RNG from the shared source under a short
@@ -482,6 +619,42 @@ func (p *Pipeline) dialUpstream(ctx context.Context, req Request, rt routed) (ne
 		return nil, &ProxyError{Code: CodeUpstreamConnectFailed, Msg: "upstream dial failed: " + err.Error()}
 	}
 	return raw, nil
+}
+
+// logRequest emits the terminal RequestLogRecord for one request
+// (spec/events.md §2). prep may be nil for pre-route failures; perr nil
+// means success.
+// logPrepared is logRequest for the prep-backed call sites: the resolved
+// identity is read back out of the Prepared state.
+func (p *Pipeline) logPrepared(req Request, prep *Prepared, netOK bool, stage string, perr *ProxyError, upN, downN int64) {
+	p.logRequest(req, prep.startedAt, resolved{platform: prep.platform, platformID: prep.PlatformID, account: prep.account}, prep, netOK, stage, perr, upN, downN)
+}
+
+func (p *Pipeline) logRequest(req Request, start time.Time, r resolved, prep *Prepared, netOK bool, stage string, perr *ProxyError, upN, downN int64) {
+	if p.d.ReqLog == nil {
+		return
+	}
+	rec := ports.RequestLogRecord{
+		TS:         start,
+		ProxyType:  req.Proto,
+		Platform:   r.platform,
+		PlatformID: r.platformID,
+		Account:    r.account,
+		Target:     req.Target,
+		NetOK:      netOK,
+		Stage:      stage,
+		DurationMs: p.d.Clock.Now().Sub(start).Milliseconds(),
+		BytesUp:    upN,
+		BytesDown:  downN,
+	}
+	if prep != nil {
+		rec.NodeHash = prep.NodeHash
+		rec.EgressIP = prep.egressIP
+	}
+	if perr != nil {
+		rec.EgressError = perr.Code
+	}
+	p.d.ReqLog(rec)
 }
 
 // --- Signal ---

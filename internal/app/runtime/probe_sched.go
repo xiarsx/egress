@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	pksignal "github.com/xiarsx/egress/pkg/signal"
-	pknode "github.com/xiarsx/egress/pkg/node"
 	"github.com/xiarsx/egress/internal/ports"
+	pknode "github.com/xiarsx/egress/pkg/node"
+	pksignal "github.com/xiarsx/egress/pkg/signal"
 )
 
 const (

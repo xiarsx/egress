@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/zeebo/xxh3"
+	"golang.org/x/net/publicsuffix"
 
 	pick "github.com/xiarsx/egress/internal/core/select"
 	pknode "github.com/xiarsx/egress/pkg/node"
@@ -155,20 +156,16 @@ func NewTracker(opts ...TrackerOption) *Tracker {
 	return t
 }
 
-// etld1 returns the bucket domain for d: the last two DNS labels,
-// lower-cased, without a trailing dot.
-//
-// TODO: replace with golang.org/x/net/publicsuffix.EffectiveTLDPlusOne
-// once x/net is a (direct) dependency; the two-label fallback mis-buckets
-// multi-level public suffixes (e.g. example.co.uk → co.uk).
+// etld1 returns the eTLD+1 bucket domain for d (publicsuffix semantics),
+// lower-cased, without a trailing dot. IPs, localhost and bare TLDs fall
+// back to the input unchanged (they are their own bucket).
 func etld1(d string) string {
 	d = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
 	if d == "" {
 		return ""
 	}
-	labels := strings.Split(d, ".")
-	if len(labels) >= 2 {
-		return strings.Join(labels[len(labels)-2:], ".")
+	if e, err := publicsuffix.EffectiveTLDPlusOne(d); err == nil {
+		return e
 	}
 	return d
 }

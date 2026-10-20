@@ -1,15 +1,19 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/xiarsx/egress/internal/ports"
+	"github.com/xiarsx/egress/internal/testutil/memstore"
 )
 
 func testMux() (*Service, *http.ServeMux) {
-	s := NewService(newMemStore(), &recordHooks{},
+	s := NewService(memstore.New(), &recordHooks{},
 		WithAdminToken("secret"),
 		WithVersion("0.1.0-test"),
 		WithSystemConfig(SystemConfig{ListenAddress: "127.0.0.1", Port: 8080, StateDir: "/s", CacheDir: "/c", LogDir: "/l"}),
@@ -273,5 +277,75 @@ func TestPaginationBadInput(t *testing.T) {
 	rec := authed(t, mux, "GET", "/api/v1/platforms?limit=999999999", "")
 	if rec.Code != 400 {
 		t.Fatalf("code = %d", rec.Code)
+	}
+}
+
+// --- request logs API (happy path through a fake RuntimeBackend) ---
+
+// stubReqLogs implements only ReqLogBackend — the ISP split means a test
+// stubs exactly the domain slice it exercises, nothing more.
+type stubReqLogs struct {
+	listFn  func(limit, offset int, platform, account, egressErr string) ([]RequestLogEntry, int, error)
+	getFn   func(id string) (RequestLogEntry, error)
+	payload any
+}
+
+func (b *stubReqLogs) ListRequestLogs(_ context.Context, limit, offset int, platform, account, egressErr string) ([]RequestLogEntry, int, error) {
+	return b.listFn(limit, offset, platform, account, egressErr)
+}
+func (b *stubReqLogs) GetRequestLog(_ context.Context, id string) (RequestLogEntry, error) {
+	return b.getFn(id)
+}
+func (b *stubReqLogs) GetRequestLogPayload(context.Context, string) (any, error) {
+	return b.payload, nil
+}
+
+func TestRequestLogsAPI(t *testing.T) {
+	s, mux := testMux()
+	entry := RequestLogEntry{
+		ID: "3:7", TsNs: 1, ProxyType: "http-forward", Platform: "Default",
+		Account: "alice", Target: "example.com:80", NetOk: true,
+	}
+	var gotFilters []string
+	s.reqLogBackend = &stubReqLogs{
+		listFn: func(limit, offset int, platform, account, egressErr string) ([]RequestLogEntry, int, error) {
+			gotFilters = []string{platform, account, egressErr}
+			return []RequestLogEntry{entry}, 1, nil
+		},
+		getFn: func(id string) (RequestLogEntry, error) {
+			if id != "3:7" {
+				return RequestLogEntry{}, ports.ErrNotFound
+			}
+			return entry, nil
+		},
+	}
+
+	rec := authed(t, mux, "GET", "/api/v1/request-logs?platform=Default&account=alice&egress_error=&limit=10&offset=0", "")
+	if rec.Code != 200 {
+		t.Fatalf("list = %d (%s)", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	items := body["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["id"] != "3:7" {
+		t.Fatalf("items = %v", items)
+	}
+	if body["total"].(float64) != 1 {
+		t.Fatalf("total = %v", body["total"])
+	}
+	if gotFilters[0] != "Default" || gotFilters[1] != "alice" {
+		t.Fatalf("filters = %v", gotFilters)
+	}
+
+	rec = authed(t, mux, "GET", "/api/v1/request-logs/3:7", "")
+	if rec.Code != 200 {
+		t.Fatalf("detail = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if decodeBody(t, rec)["target"] != "example.com:80" {
+		t.Fatalf("detail body = %s", rec.Body.String())
+	}
+
+	rec = authed(t, mux, "GET", "/api/v1/request-logs/9:9", "")
+	if rec.Code != 404 {
+		t.Fatalf("missing detail = %d", rec.Code)
 	}
 }

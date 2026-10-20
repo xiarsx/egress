@@ -5,11 +5,6 @@ info:
   description: |
     egress 控制面 API（spec-first：先改本文件并评审，再生成/修改代码）。
 
-    兼容性说明（相对 Resin 参考实现）：
-    - 路径前缀与资源路径保持兼容：`/api/v1/...`，如 `/api/v1/platforms`。
-    - `/api/v1/subscriptions` 更名为 `/api/v1/sources`（kind 名 Source）。
-    - `/api/v1/account-header-rules` 被 `/api/v1/identity-policies` 取代
-      （原 Platform 的反代字段与全局 Header 规则表收敛为 IdentityPolicy 资源）。
     - Action 统一为 `POST <资源>/actions/<verb>` 形式，实现设计中的
       `:refresh :probe :release :rebuild :apply` 约定。
 
@@ -23,7 +18,7 @@ info:
       未认证返回 401 `{error: {code: "UNAUTHORIZED"}}`。
     - `GET /healthz` 无需认证。
 servers:
-  - url: http://127.0.0.1:8080
+  - url: http://127.0.0.1:2260
 security:
   - bearerAuth: []
 
@@ -562,10 +557,10 @@ paths:
         - name: account
           in: query
           schema: { type: string }
-        - name: resin_error
+        - name: egress_error
           in: query
           schema: { type: string }
-          description: 按 X-Resin-Error 码过滤
+          description: 按 X-Egress-Error 码过滤
       responses:
         '200':
           description: OK
@@ -982,6 +977,11 @@ components:
         allow_socks5: { type: boolean }
         created_at_ns: { type: integer }
         updated_at_ns: { type: integer }
+        read_only:
+          type: boolean
+          description: 环境变量定义的默认入口（运行时合成，永不存储，只读）
+        listening: { type: boolean }
+        last_error: { type: string }
     EndpointInput:
       type: object
       properties:
@@ -1016,7 +1016,7 @@ components:
         net_ok: { type: boolean }
         http_status: { type: integer }
         stage: { type: string }
-        resin_error: { type: string }
+        egress_error: { type: string }
         duration_ms: { type: integer }
         bytes_up: { type: integer }
         bytes_down: { type: integer }

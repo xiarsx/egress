@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +44,17 @@ var DefaultAuthorityDomains = map[string]bool{
 	"github.com":     true,
 }
 
+// DefaultAuthorityDomainList returns the default authority domains as a
+// sorted slice, ready for pick.Policy.Authorities.
+func DefaultAuthorityDomainList() []string {
+	out := make([]string, 0, len(DefaultAuthorityDomains))
+	for d := range DefaultAuthorityDomains {
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // TrafficDeferWindow is the default window during which recent passive
 // traffic pushes a node's next active probe back (design §6.3: "被动流量会
 // 推迟节点的下次探测时间"). Tune via Prober.TrafficDefer.
@@ -73,6 +86,9 @@ type Prober struct {
 	// AuthorityDomains marks latency domains whose samples are authority
 	// samples (TD-EWMA permanent slots). Nil selects DefaultAuthorityDomains.
 	AuthorityDomains map[string]bool
+	// TraceURL overrides EgressTraceURL (ops/test hook, e.g. a local trace
+	// endpoint). Plain-http URLs are dialed through the node without TLS.
+	TraceURL string
 	// TrafficDefer is how long after the last passive traffic a probe is
 	// deferred; zero selects TrafficDeferWindow.
 	TrafficDefer time.Duration
@@ -115,14 +131,28 @@ func (p *Prober) ProbeEgress(ctx context.Context, h pknode.Hash) {
 // fetchTrace performs the trace request through the node's dialer and
 // returns the parsed egress IP and the request round-trip time.
 func (p *Prober) fetchTrace(ctx context.Context, h pknode.Hash) (netip.Addr, time.Duration, error) {
+	traceURL := p.TraceURL
+	if traceURL == "" {
+		traceURL = EgressTraceURL
+	}
+	u, err := url.Parse(traceURL)
+	if err != nil {
+		return netip.Addr{}, 0, fmt.Errorf("prober: bad trace url: %w", err)
+	}
+	serverName := u.Hostname()
 	start := p.now()
 	tr := &http.Transport{
+		// Plain http:// trace URLs still traverse the node (DialContext is
+		// used for non-TLS schemes); https goes through DialTLSContext.
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return p.Dialer.DialContext(ctx, h, network, addr)
+		},
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			raw, err := p.Dialer.DialContext(ctx, h, network, addr)
 			if err != nil {
 				return nil, err
 			}
-			tc := tls.Client(raw, &tls.Config{ServerName: egressTraceHost})
+			tc := tls.Client(raw, &tls.Config{ServerName: serverName})
 			if err := tc.HandshakeContext(ctx); err != nil {
 				raw.Close()
 				return nil, err
@@ -134,7 +164,7 @@ func (p *Prober) fetchTrace(ctx context.Context, h pknode.Hash) (netip.Addr, tim
 	tr.DisableKeepAlives = true
 	client := &http.Client{Transport: tr}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, EgressTraceURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, traceURL, nil)
 	if err != nil {
 		return netip.Addr{}, 0, err
 	}

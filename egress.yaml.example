@@ -36,11 +36,14 @@ metadata:
   name: static-nodes
 spec:
   type: local
-  # Any format singbox.ParseSubscription accepts: sing-box/Clash JSON,
-  # URI lines (vmess://, vless://, trojan://, ss://, ...), or
+  # Parser accepts: sing-box/Clash JSON, Clash YAML, URI lines
+  # (vmess://, vless://, trojan://, ss://, hysteria2://, ...), or
   # IP:PORT[:USER:PASS] lines. Base64-wrapped content is unwrapped.
+  # NOTE: parse != dial — the native dialer currently supports
+  # direct/http/https/socks/socks5/socks5h only; other parsed types stay
+  # in the pool but fail closed at dial time (see spec/resources/source.md).
   content: |
-    trojan://password@example.net:443#static-1
+    socks5h://user:pass@example.net:1080#static-1
   updateInterval: 0s
   enabled: true
 ---

@@ -45,7 +45,7 @@ func ParseReqLogID(s string) (ReqLogID, error) {
 // Filters are exact matches; empty means no filter. Returns the page and
 // the total count. It opens files read-only; safe to call while the
 // writer is appending.
-func (r *ReqLog) QueryReqLogs(limit, offset int, platform, account, resinErr string) ([]ReqLogEntry, int, error) {
+func (r *ReqLog) QueryReqLogs(limit, offset int, platform, account, egressErr string) ([]ReqLogEntry, int, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -66,9 +66,9 @@ func (r *ReqLog) QueryReqLogs(limit, offset int, platform, account, resinErr str
 		conds = append(conds, "account = ?")
 		args = append(args, account)
 	}
-	if resinErr != "" {
-		conds = append(conds, "resin_error = ?")
-		args = append(args, resinErr)
+	if egressErr != "" {
+		conds = append(conds, "egress_error = ?")
+		args = append(args, egressErr)
 	}
 	where := ""
 	if len(conds) > 0 {
@@ -112,7 +112,9 @@ func (r *ReqLog) QueryReqLogs(limit, offset int, platform, account, resinErr str
 	}
 	out := make([]ReqLogEntry, 0, end-offset)
 	for _, row := range all[offset:end] {
-		out = append(out, row.Entry)
+		e := row.Entry
+		e.ID = ReqLogID{Seq: row.Seq, ID: row.ID}
+		out = append(out, e)
 	}
 	_ = total
 	return out, len(all), nil
@@ -126,7 +128,7 @@ type reqLogRow struct {
 
 func queryReqLogFile(db *sql.DB, seq int, where string, args []any) ([]reqLogRow, error) {
 	q := `SELECT id, ts_ns, proxy_type, platform, account, target, node,
-		egress_ip, net_ok, http_status, stage, resin_error,
+		egress_ip, net_ok, http_status, stage, egress_error,
 		duration_ms, bytes_up, bytes_down
 		FROM request_logs ` + where + ` ORDER BY ts_ns DESC, id DESC`
 	rows, err := db.Query(q, args...)
@@ -141,7 +143,7 @@ func queryReqLogFile(db *sql.DB, seq int, where string, args []any) ([]reqLogRow
 		var netOk int
 		if err := rows.Scan(&id, &tsNs, &e.ProxyType, &e.Platform, &e.Account,
 			&e.Target, &e.Node, &e.EgressIP, &netOk, &e.HTTPStatus, &e.Stage,
-			&e.ResinError, &e.DurationMs, &e.BytesUp, &e.BytesDown); err != nil {
+			&e.EgressError, &e.DurationMs, &e.BytesUp, &e.BytesDown); err != nil {
 			return nil, err
 		}
 		e.TS = time.Unix(0, tsNs)
@@ -164,7 +166,12 @@ func (r *ReqLog) GetReqLog(id ReqLogID) (ReqLogEntry, int64, error) {
 			return ReqLogEntry{}, 0, err
 		}
 		defer db.Close()
-		return scanOneReqLog(db, id.ID)
+		e, rid, qerr := scanOneReqLog(db, id.ID)
+		if qerr != nil {
+			return ReqLogEntry{}, 0, qerr
+		}
+		e.ID = id
+		return e, rid, nil
 	}
 	for i := len(seqs) - 1; i >= 0; i-- {
 		db, err := sql.Open("sqlite", "file:"+r.dir+"/"+reqLogFileName(seqs[i])+"?mode=ro")
@@ -174,6 +181,7 @@ func (r *ReqLog) GetReqLog(id ReqLogID) (ReqLogEntry, int64, error) {
 		e, rid, qerr := scanOneReqLog(db, id.ID)
 		db.Close()
 		if qerr == nil {
+			e.ID = ReqLogID{Seq: seqs[i], ID: rid}
 			return e, rid, nil
 		}
 	}
@@ -185,12 +193,12 @@ func scanOneReqLog(db *sql.DB, id int64) (ReqLogEntry, int64, error) {
 	var tsNs int64
 	var netOk int
 	err := db.QueryRow(`SELECT id, ts_ns, proxy_type, platform, account, target, node,
-		egress_ip, net_ok, http_status, stage, resin_error,
+		egress_ip, net_ok, http_status, stage, egress_error,
 		duration_ms, bytes_up, bytes_down
 		FROM request_logs WHERE id = ?`, id).Scan(
 		&id, &tsNs, &e.ProxyType, &e.Platform, &e.Account,
 		&e.Target, &e.Node, &e.EgressIP, &netOk, &e.HTTPStatus, &e.Stage,
-		&e.ResinError, &e.DurationMs, &e.BytesUp, &e.BytesDown)
+		&e.EgressError, &e.DurationMs, &e.BytesUp, &e.BytesDown)
 	if err != nil {
 		return ReqLogEntry{}, 0, err
 	}

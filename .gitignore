@@ -1,0 +1,11 @@
+# binaries
+/egress.exe
+/egress
+
+# frontend build artifacts
+/webui/node_modules/
+/webui/dist/
+
+# local scratch
+/.pr-work/
+*.log

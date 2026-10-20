@@ -10,7 +10,7 @@ kind: Source
 metadata:
   name: main
 spec:
-  type: remote            # remote | local
+  type: remote            # remote | local | <扩展 SourceProvider 名>
   url: https://example.com/sub.txt   # type=remote 时必填
   # content: |            # type=local 时必填：内联订阅内容
   #   vmess://...
@@ -25,7 +25,7 @@ spec:
 | 字段 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
 | `metadata.name` | string | 是 | — | 来源名，全局唯一；节点 Tag 形如 `<sourceName>/<rawTag>` |
-| `spec.type` | enum | 是 | — | `remote`（URL 下载）\| `local`（内联内容） |
+| `spec.type` | enum | 是 | — | `remote`（URL 下载）\| `local`（内联内容）\| 其他已注册的扩展 `SourceProvider` 名（spec/ext-abi.md §2；未注册 = 刷新报错并保留旧快照） |
 | `spec.url` | string | `remote` 时必填 | — | 订阅 URL |
 | `spec.content` | string | `local` 时必填 | — | 内联订阅内容 |
 | `spec.updateInterval` | duration | 否 | TODO | 同步间隔；`remote` 不得短于 30s |
@@ -41,6 +41,14 @@ spec:
 - 解析器支持：sing-box JSON、Clash JSON/YAML、URI 行
   （vmess / vless / trojan / ss / hysteria2 / http(s) / socks5(h)）、
   `IP:PORT[:USER:PASS]` 文本，以及它们的 base64 包裹。
+- **拨号能力**（能力矩阵）：拨号由内嵌 sing-box 出站引擎提供，覆盖其全部
+  协议族 —— `vmess`（含 ws/grpc 传输）、`vless`（含 REALITY）、`trojan`、
+  `shadowsocks`（含 2022 系列）、`socks`、`http`、`direct` 等。
+  QUIC 协议（`hysteria2` / `tuic` / `hysteria`）与 VLESS REALITY 的 uTLS
+  依赖 build tag；官方构建使用 `-tags "with_quic with_utls"`（Dockerfile 已带）。
+  `wireguard` 不编译进二进制；未支持类型一律 fail-closed
+  （`ErrUnsupportedOutbound` → `UPSTREAM_CONNECT_FAILED`），不会静默直连。
+  拨号类型扩展随 sing-box 版本升级获得，不动解析器。
 - 新格式与新来源通过 **SourceProvider** 扩展点接入（见 [../ext-abi.md](../ext-abi.md)）。
 - 资源下载统一走 `Fetcher = Direct ⊕ ViaDefaultPlatform ⊕ ViaDefaultPlatform`，
   订阅与 GeoIP 共用。

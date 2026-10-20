@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,17 +13,48 @@ import (
 	"github.com/xiarsx/egress/internal/core/identity"
 	"github.com/xiarsx/egress/internal/core/predicate"
 	"github.com/xiarsx/egress/internal/ports"
+	"github.com/xiarsx/egress/internal/testutil/memstore"
 	pknode "github.com/xiarsx/egress/pkg/node"
 )
 
 func yamlUnmarshal(b []byte, v any) error { return yaml.Unmarshal(b, v) }
 
+// recordHooks records hook calls for assertions.
+type recordHooks struct {
+	mu              sync.Mutex
+	platformChanged []string
+	platformDeleted []string
+	sourceChanged   []string
+	sourceDeleted   []string
+}
+
+func (h *recordHooks) OnPlatformChanged(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.platformChanged = append(h.platformChanged, id)
+}
+func (h *recordHooks) OnPlatformDeleted(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.platformDeleted = append(h.platformDeleted, id)
+}
+func (h *recordHooks) OnSourceChanged(name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sourceChanged = append(h.sourceChanged, name)
+}
+func (h *recordHooks) OnSourceDeleted(name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sourceDeleted = append(h.sourceDeleted, name)
+}
+
 func compileForTest(spec ports.PlatformSpec) (pknode.Predicate, error) {
 	return predicate.Compile(spec.Filter)
 }
 
-func testService() (*Service, *memStore, *recordHooks) {
-	st := newMemStore()
+func testService() (*Service, *memstore.Store, *recordHooks) {
+	st := memstore.New()
 	h := &recordHooks{}
 	s := NewService(st, h)
 	return s, st, h
@@ -149,7 +181,7 @@ func TestPlatformSpecAssembly(t *testing.T) {
 	s, _, _ := testService()
 	ctx := context.Background()
 
-	header := "X-Resin-Account"
+	header := "X-Egress-Account"
 	if err := s.ApplyIdentityPolicy(ctx, IdentityPolicy{
 		Name: "default",
 		Chain: []PolicyStep{
@@ -210,7 +242,7 @@ func TestPlatformSpecAssembly(t *testing.T) {
 		t.Fatalf("chain len = %d", len(spec.Policy.Chain))
 	}
 	st0 := spec.Policy.Chain[0]
-	if st0.Kind != identity.StepHeader || st0.Header != "X-Resin-Account" {
+	if st0.Kind != identity.StepHeader || st0.Header != "X-Egress-Account" {
 		t.Fatalf("step0 = %+v", st0)
 	}
 	if spec.Policy.Chain[1].Kind != identity.StepWire {
@@ -294,7 +326,7 @@ func TestApplyRecipe(t *testing.T) {
 	s, _, _ := testService()
 	ctx := context.Background()
 
-	header := "X-Resin-Account"
+	header := "X-Egress-Account"
 	if err := s.ImportRecipe(ctx, Recipe{
 		Name:    "example-api",
 		Version: "1.2.0",
@@ -428,7 +460,7 @@ func TestResetPlatform(t *testing.T) {
 func TestWireStepYAMLRoundTrip(t *testing.T) {
 	// `wire: {}` in YAML must decode into a non-nil Wire marker.
 	var p IdentityPolicy
-	y := "chain:\n  - header: X-Resin-Account\n  - wire: {}\n  - headerRule:\n      rules:\n        - {prefix: \"*\", headers: [Authorization]}\nonMiss: random\n"
+	y := "chain:\n  - header: X-Egress-Account\n  - wire: {}\n  - headerRule:\n      rules:\n        - {prefix: \"*\", headers: [Authorization]}\nonMiss: random\n"
 	if err := yamlUnmarshal([]byte(y), &p); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +474,91 @@ func TestWireStepYAMLRoundTrip(t *testing.T) {
 	if pol.Chain[1].Kind != identity.StepWire {
 		t.Fatalf("step1 kind = %v", pol.Chain[1].Kind)
 	}
-	if !strings.Contains(pol.Chain[0].Header, "X-Resin-Account") {
+	if !strings.Contains(pol.Chain[0].Header, "X-Egress-Account") {
 		t.Fatalf("step0 = %+v", pol.Chain[0])
 	}
 }
+
+// TestEndpointDefaultSynthesis covers spec/resources/endpoint.md: the
+// env-defined default endpoint is synthesized (read-only, all caps),
+// "default" is reserved, and runtime state decorates reads.
+func TestEndpointDefaultSynthesis(t *testing.T) {
+	s := NewService(memstore.New(), NopHooks{},
+		WithSystemConfig(SystemConfig{ListenAddress: "0.0.0.0", Port: 2260}),
+	)
+	s.SetEndpointHooks(nil, func(name string) (EndpointStatus, bool) {
+		if name == DefaultEndpointName {
+			return EndpointStatus{Listening: true}, true
+		}
+		return EndpointStatus{}, false
+	})
+	ctx := context.Background()
+
+	items, total, err := s.ListEndpoints(ctx, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(items) != 1 {
+		t.Fatalf("list = %d/%d", len(items), total)
+	}
+	def := items[0]
+	if def.Name != DefaultEndpointName || !def.ReadOnly || !def.Listening {
+		t.Fatalf("default = %+v", def)
+	}
+	if def.Port != 2260 || !def.AllowManagement || !def.AllowProxy || !def.AllowSOCKS5 ||
+		!def.AllowHTTPForward || !def.AllowHTTPReverse || !def.Enabled {
+		t.Fatalf("default caps = %+v", def)
+	}
+
+	got, err := s.GetEndpoint(ctx, "default")
+	if err != nil || !got.ReadOnly {
+		t.Fatalf("get default = %+v, %v", got, err)
+	}
+
+	// "default" is reserved across all write paths.
+	if err := s.ApplyEndpoint(ctx, Endpoint{Name: "default", Port: 9999}); err == nil {
+		t.Fatal("apply must reject the reserved name")
+	}
+	if _, err := s.PatchEndpoint(ctx, "default", []byte(`{"port":9999}`)); err == nil {
+		t.Fatal("patch must reject the reserved name")
+	}
+	if err := s.DeleteEndpoint(ctx, "default"); err == nil {
+		t.Fatal("delete must reject the read-only default")
+	}
+}
+
+// TestEndpointHooksFire verifies the ingress layer is notified on
+// create/patch/delete (spec/resources/endpoint.md: 增删改立即生效).
+func TestEndpointHooksFire(t *testing.T) {
+	s := NewService(memstore.New(), NopHooks{})
+	var changed, deleted []string
+	s.SetEndpointHooks(hooksFunc{
+		changed: func(n string) { changed = append(changed, n) },
+		deleted: func(n string) { deleted = append(deleted, n) },
+	}, nil)
+	ctx := context.Background()
+
+	if err := s.ApplyEndpoint(ctx, Endpoint{Name: "e1", Port: 2301, AllowProxy: true, AllowSOCKS5: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PatchEndpoint(ctx, "e1", []byte(`{"enabled":false}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteEndpoint(ctx, "e1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 2 || changed[0] != "e1" || changed[1] != "e1" {
+		t.Fatalf("changed = %v, want 2 notifications", changed)
+	}
+	if len(deleted) != 1 || deleted[0] != "e1" {
+		t.Fatalf("deleted = %v", deleted)
+	}
+}
+
+type hooksFunc struct {
+	changed func(string)
+	deleted func(string)
+}
+
+func (h hooksFunc) OnEndpointChanged(name string) { h.changed(name) }
+func (h hooksFunc) OnEndpointDeleted(name string) { h.deleted(name) }

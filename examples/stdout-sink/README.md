@@ -19,6 +19,15 @@ ext.RegisterSink(&stdoutSink{...})
 
 Look it up any time with `ext.GetSink("stdout")`.
 
+## Build a custom binary
+
+From your module root (requires egress + this module):
+
+```bash
+egress build --with github.com/xiarsx/egress/examples/stdout-sink -o egress-custom
+```
+
+
 ## Notes
 
 - Example-grade, not production-grade: `Consume` serializes on a mutex

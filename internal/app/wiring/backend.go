@@ -13,12 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
-	pklease "github.com/xiarsx/egress/pkg/lease"
-	pknode "github.com/xiarsx/egress/pkg/node"
 	"github.com/xiarsx/egress/internal/adapters/geoip"
 	"github.com/xiarsx/egress/internal/adapters/sqlite"
 	"github.com/xiarsx/egress/internal/app/control"
@@ -28,6 +27,8 @@ import (
 	"github.com/xiarsx/egress/internal/core/predicate"
 	"github.com/xiarsx/egress/internal/core/view"
 	"github.com/xiarsx/egress/internal/ports"
+	pklease "github.com/xiarsx/egress/pkg/lease"
+	pknode "github.com/xiarsx/egress/pkg/node"
 )
 
 // Backend 实现 control.RuntimeBackend。
@@ -44,6 +45,8 @@ type Backend struct {
 	GeoDBPath string // 为空表示未配置 GeoIP
 	Prober    *runtime.Prober
 	Clock     ports.Clock
+	// Realtime serves /metrics/realtime/* from the in-memory tracker.
+	Realtime *RealtimeTracker
 }
 
 var _ control.RuntimeBackend = (*Backend)(nil)
@@ -433,13 +436,44 @@ func (b *Backend) queryMetrics(name string, limit int) ([]metricPoint, error) {
 	return out, rows.Err()
 }
 
-func (b *Backend) MetricRealtime(ctx context.Context, name string) (any, error) {
-	// 实时 ring buffer 尚未实现（TODO）；返回最近 flush 的桶近似。
-	pts, err := b.queryMetrics(name, 50)
-	if err != nil {
-		return nil, err
+func (b *Backend) MetricRealtime(ctx context.Context, name string, query url.Values) (any, error) {
+	if b.Realtime == nil {
+		return nil, errors.New("realtime tracker not wired")
 	}
-	return map[string]any{"points": pts, "realtime": false}, nil
+	from := parseTimeParam(query.Get("from"))
+	to := parseTimeParam(query.Get("to"))
+	switch name {
+	case "throughput":
+		return map[string]any{
+			"step_seconds": int(RealtimeStep / time.Second),
+			"items":        b.Realtime.Throughput(from, to),
+		}, nil
+	case "connections":
+		return map[string]any{
+			"step_seconds": int(RealtimeStep / time.Second),
+			"items":        b.Realtime.Connections(from, to),
+		}, nil
+	case "leases":
+		platformID := query.Get("platform_id")
+		return map[string]any{
+			"step_seconds": int(RealtimeStep / time.Second),
+			"items":        b.Realtime.Leases(from, to, platformID),
+			"platform_id":  platformID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("%w: unknown realtime metric %q", ports.ErrNotFound, name)
+	}
+}
+
+// parseTimeParam parses an RFC3339 bound; empty/invalid means unbounded.
+func parseTimeParam(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	return time.Time{}
 }
 
 func (b *Backend) MetricHistory(ctx context.Context, name string) (any, error) {
@@ -470,28 +504,29 @@ func (b *Backend) MetricSnapshot(ctx context.Context, name string) (any, error) 
 
 func toControlReqLog(e sqlite.ReqLogEntry) control.RequestLogEntry {
 	return control.RequestLogEntry{
-		TsNs:       e.TS.UnixNano(),
-		ProxyType:  e.ProxyType,
-		Platform:   e.Platform,
-		Account:    e.Account,
-		Target:     e.Target,
-		Node:       e.Node,
-		EgressIP:   e.EgressIP,
-		NetOk:      e.NetOK,
-		HTTPStatus: e.HTTPStatus,
-		Stage:      e.Stage,
-		ResinError: e.ResinError,
-		DurationMs: e.DurationMs,
-		BytesUp:    e.BytesUp,
-		BytesDown:  e.BytesDown,
+		ID:          e.ID.String(),
+		TsNs:        e.TS.UnixNano(),
+		ProxyType:   e.ProxyType,
+		Platform:    e.Platform,
+		Account:     e.Account,
+		Target:      e.Target,
+		Node:        e.Node,
+		EgressIP:    e.EgressIP,
+		NetOk:       e.NetOK,
+		HTTPStatus:  e.HTTPStatus,
+		Stage:       e.Stage,
+		EgressError: e.EgressError,
+		DurationMs:  e.DurationMs,
+		BytesUp:     e.BytesUp,
+		BytesDown:   e.BytesDown,
 	}
 }
 
-func (b *Backend) ListRequestLogs(ctx context.Context, limit, offset int, platform, account, resinErr string) ([]control.RequestLogEntry, int, error) {
+func (b *Backend) ListRequestLogs(ctx context.Context, limit, offset int, platform, account, egressErr string) ([]control.RequestLogEntry, int, error) {
 	if b.ReqLog == nil {
 		return nil, 0, errors.New("request log not wired")
 	}
-	entries, total, err := b.ReqLog.QueryReqLogs(limit, offset, platform, account, resinErr)
+	entries, total, err := b.ReqLog.QueryReqLogs(limit, offset, platform, account, egressErr)
 	if err != nil {
 		return nil, 0, err
 	}

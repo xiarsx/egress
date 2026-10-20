@@ -215,7 +215,8 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-func encodeHealth(h pknode.Health) (kind, failures int, since int64) {	kind = int(h.Kind)
+func encodeHealth(h pknode.Health) (kind, failures int, since int64) {
+	kind = int(h.Kind)
 	failures = h.Failures
 	if h.Kind == pknode.HealthTripped {
 		since = h.Since.UTC().UnixNano()

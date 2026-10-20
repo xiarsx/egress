@@ -65,13 +65,15 @@ Selector 与 IdentityResolver 位于热路径，必须同时满足：
    出现在调用内（预编译好再进热路径）。
 4. IdentityResolver 只读请求元数据。
 
-违反者不得合入内置发布版；编译期模块的违规由 `egress build` 的
-benchmark 门槛拦截（TODO：门槛数值 M4 确定）。
+违反者不得合入内置发布版；编译期模块的违规由代码评审拦截
+（`egress build` 不做运行时检查；benchmark 门槛数值留待后续里程碑）。
 
 ## 4. 分发：保持单二进制（P3）
 
 - **编译期模块**（Caddy/xcaddy 模式）：扩展在 `init()` 中向 `pkg/ext` 注册，
-  通过 `egress build --with <module>@<version>` 产出定制二进制。
+  通过 `egress build --with <module> [-o out]` 产出定制二进制：在调用方
+  Go 模块根目录执行，生成 blank-import 各扩展模块并调用 `boot.Main` 的
+  临时 main 包，`go build` 后清理。
   官方发布版只含内置模块。
 - **进程外协议**（仅限旁路扩展：SourceProvider、Sink、Prober）：HTTP 或
   stdio JSON 协议，任何语言都能写，egress 只作为客户端。

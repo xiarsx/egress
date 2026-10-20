@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -35,40 +36,71 @@ const (
 // (see WithRuntimeBackend) those routes answer 501 NOT_IMPLEMENTED in the
 // standard error envelope.
 //
+// The runtime backend surface is segregated by domain (ISP): handlers
+// depend only on their own slice, and tests stub only what they exercise.
 // Backend methods should return an error wrapping ports.ErrNotFound when the
 // addressed object does not exist so the API can map it to 404.
-type RuntimeBackend interface {
-	// Nodes.
+
+// NodeBackend serves node reads, probes and filter previews.
+type NodeBackend interface {
 	ListNodes(ctx context.Context, limit, offset int, health, platform string) ([]Node, int, error)
 	GetNode(ctx context.Context, hash string) (Node, error)
 	ProbeNode(ctx context.Context, hash string, kind ProbeKind) error
 	PreviewFilter(ctx context.Context, f PlatformFilter) (matched, total int, err error)
+}
 
-	// Leases.
+// LeaseBackend serves lease reads and releases.
+type LeaseBackend interface {
 	ListLeases(ctx context.Context, platformID string, limit, offset int) ([]Lease, int, error)
 	GetLease(ctx context.Context, platformID, account string) (Lease, error)
 	ReleaseLease(ctx context.Context, platformID, account string) error
 	ReleaseAllLeases(ctx context.Context, platformID string) error
 	IPLoad(ctx context.Context, platformID string) (map[string]int64, error)
+}
 
-	// Views and sources.
+// ViewBackend rebuilds derived routing views.
+type ViewBackend interface {
 	RebuildRoutableView(ctx context.Context, platformID string) error
-	RefreshSource(ctx context.Context, name string) error
+}
 
-	// Metrics (name is the path tail, e.g. "throughput").
-	MetricRealtime(ctx context.Context, name string) (any, error)
+// SourceBackend triggers source refreshes.
+type SourceBackend interface {
+	RefreshSource(ctx context.Context, name string) error
+}
+
+// MetricsBackend serves the metrics reads. name is the path tail (e.g.
+// "throughput"); Realtime gets the raw query values: from/to (RFC3339
+// window bounds) and platform_id (leases series only).
+type MetricsBackend interface {
+	MetricRealtime(ctx context.Context, name string, query url.Values) (any, error)
 	MetricHistory(ctx context.Context, name string) (any, error)
 	MetricSnapshot(ctx context.Context, name string) (any, error)
+}
 
-	// Request logs.
-	ListRequestLogs(ctx context.Context, limit, offset int, platform, account, resinErr string) ([]RequestLogEntry, int, error)
+// ReqLogBackend serves request-log reads.
+type ReqLogBackend interface {
+	ListRequestLogs(ctx context.Context, limit, offset int, platform, account, egressErr string) ([]RequestLogEntry, int, error)
 	GetRequestLog(ctx context.Context, id string) (RequestLogEntry, error)
 	GetRequestLogPayload(ctx context.Context, id string) (any, error)
+}
 
-	// GeoIP.
+// GeoBackend serves GeoIP status, lookups and updates.
+type GeoBackend interface {
 	GeoIPStatus(ctx context.Context) (any, error)
 	GeoIPLookup(ctx context.Context, ips []string) (any, error)
 	GeoIPUpdateNow(ctx context.Context) error
+}
+
+// RuntimeBackend is the union the assembly root wires once; the service
+// splits it into the domain slices above.
+type RuntimeBackend interface {
+	NodeBackend
+	LeaseBackend
+	ViewBackend
+	SourceBackend
+	MetricsBackend
+	ReqLogBackend
+	GeoBackend
 }
 
 // ---------------------------------------------------------------------------
@@ -302,14 +334,17 @@ func (s *Service) readPatchBody(r *http.Request) ([]byte, error) {
 	return b, nil
 }
 
-// backendOr501 returns the backend or writes 501.
-func (s *Service) backendOr501(w http.ResponseWriter, what string) RuntimeBackend {
-	if s.backend == nil {
+// backendOr501 returns the domain backend or writes 501. The any()==nil
+// check is safe here: backends are only ever assigned a concrete
+// implementation or left unset (never a typed nil).
+func backendOr501[T any](w http.ResponseWriter, what string, b T) (T, bool) {
+	if any(b) == nil {
 		writeError(w, http.StatusNotImplemented, "NOT_IMPLEMENTED",
 			fmt.Sprintf("%s is served by the runtime backend, which is not wired", what))
-		return nil
+		var zero T
+		return zero, false
 	}
-	return s.backend
+	return b, true
 }
 
 // ---------------------------------------------------------------------------
@@ -373,11 +408,7 @@ var envVarsForEndpoint = []struct {
 func (s *Service) handleSystemConfigEnv(w http.ResponseWriter, r *http.Request) {
 	out := make(map[string]string, len(envVarsForEndpoint))
 	for _, v := range envVarsForEndpoint {
-		val, ok := os.LookupEnv(v.env)
-		if !ok || val == "" {
-			legacy := "RESIN_" + strings.TrimPrefix(v.env, "EGRESS_")
-			val, _ = os.LookupEnv(legacy)
-		}
+		val, _ := os.LookupEnv(v.env)
 		if v.secret && val != "" {
 			val = "***"
 		}
@@ -435,8 +466,8 @@ func (s *Service) handlePreviewFilter(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_ARGUMENT", trimControlPrefix(err.Error()))
 		return
 	}
-	b := s.backendOr501(w, "filter preview")
-	if b == nil {
+	b, ok := backendOr501(w, "filter preview", s.nodeBackend)
+	if !ok {
 		return
 	}
 	matched, total, err := b.PreviewFilter(r.Context(), body.Filter)
@@ -503,8 +534,8 @@ func (s *Service) handleRebuildView(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	b := s.backendOr501(w, "view rebuild")
-	if b == nil {
+	b, ok := backendOr501(w, "view rebuild", s.viewBackend)
+	if !ok {
 		return
 	}
 	if err := b.RebuildRoutableView(r.Context(), id); err != nil {
@@ -519,8 +550,8 @@ func (s *Service) handleListLeases(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	b := s.backendOr501(w, "leases")
-	if b == nil {
+	b, ok := backendOr501(w, "leases", s.leaseBackend)
+	if !ok {
 		return
 	}
 	limit, offset, err := parsePagination(r)
@@ -544,8 +575,8 @@ func (s *Service) handleDeleteLeases(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	b := s.backendOr501(w, "leases")
-	if b == nil {
+	b, ok := backendOr501(w, "leases", s.leaseBackend)
+	if !ok {
 		return
 	}
 	if err := b.ReleaseAllLeases(r.Context(), id); err != nil {
@@ -560,8 +591,8 @@ func (s *Service) handleGetLease(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	b := s.backendOr501(w, "leases")
-	if b == nil {
+	b, ok := backendOr501(w, "leases", s.leaseBackend)
+	if !ok {
 		return
 	}
 	l, err := b.GetLease(r.Context(), id, r.PathValue("account"))
@@ -577,8 +608,8 @@ func (s *Service) handleReleaseLease(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	b := s.backendOr501(w, "leases")
-	if b == nil {
+	b, ok := backendOr501(w, "leases", s.leaseBackend)
+	if !ok {
 		return
 	}
 	if err := b.ReleaseLease(r.Context(), id, r.PathValue("account")); err != nil {
@@ -593,8 +624,8 @@ func (s *Service) handleIPLoad(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	b := s.backendOr501(w, "ip-load")
-	if b == nil {
+	b, ok := backendOr501(w, "ip-load", s.leaseBackend)
+	if !ok {
 		return
 	}
 	m, err := b.IPLoad(r.Context(), id)
@@ -748,8 +779,8 @@ func (s *Service) handleRefreshSource(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
-	b := s.backendOr501(w, "source refresh")
-	if b == nil {
+	b, ok := backendOr501(w, "source refresh", s.sourceBackend)
+	if !ok {
 		return
 	}
 	if err := b.RefreshSource(r.Context(), src.Name); err != nil {
@@ -881,8 +912,8 @@ func (s *Service) handleApplyRecipe(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (s *Service) handleListNodes(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "nodes")
-	if b == nil {
+	b, ok := backendOr501(w, "nodes", s.nodeBackend)
+	if !ok {
 		return
 	}
 	limit, offset, err := parsePagination(r)
@@ -903,8 +934,8 @@ func (s *Service) handleListNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleGetNode(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "nodes")
-	if b == nil {
+	b, ok := backendOr501(w, "nodes", s.nodeBackend)
+	if !ok {
 		return
 	}
 	n, err := b.GetNode(r.Context(), r.PathValue("hash"))
@@ -924,8 +955,8 @@ func (s *Service) handleProbeLatency(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleProbe(w http.ResponseWriter, r *http.Request, kind ProbeKind) {
-	b := s.backendOr501(w, "probes")
-	if b == nil {
+	b, ok := backendOr501(w, "probes", s.nodeBackend)
+	if !ok {
 		return
 	}
 	if err := b.ProbeNode(r.Context(), r.PathValue("hash"), kind); err != nil {
@@ -1007,8 +1038,8 @@ func (s *Service) handleDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (s *Service) handleListRequestLogs(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "request logs")
-	if b == nil {
+	b, ok := backendOr501(w, "request logs", s.reqLogBackend)
+	if !ok {
 		return
 	}
 	limit, offset, err := parsePagination(r)
@@ -1017,7 +1048,7 @@ func (s *Service) handleListRequestLogs(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	q := r.URL.Query()
-	items, total, err := b.ListRequestLogs(r.Context(), limit, offset, q.Get("platform"), q.Get("account"), q.Get("resin_error"))
+	items, total, err := b.ListRequestLogs(r.Context(), limit, offset, q.Get("platform"), q.Get("account"), q.Get("egress_error"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -1029,8 +1060,8 @@ func (s *Service) handleListRequestLogs(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Service) handleGetRequestLog(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "request logs")
-	if b == nil {
+	b, ok := backendOr501(w, "request logs", s.reqLogBackend)
+	if !ok {
 		return
 	}
 	e, err := b.GetRequestLog(r.Context(), r.PathValue("log_id"))
@@ -1042,8 +1073,8 @@ func (s *Service) handleGetRequestLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleGetRequestLogPayload(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "request logs")
-	if b == nil {
+	b, ok := backendOr501(w, "request logs", s.reqLogBackend)
+	if !ok {
 		return
 	}
 	p, err := b.GetRequestLogPayload(r.Context(), r.PathValue("log_id"))
@@ -1059,8 +1090,8 @@ func (s *Service) handleGetRequestLogPayload(w http.ResponseWriter, r *http.Requ
 // ---------------------------------------------------------------------------
 
 func (s *Service) handleMetric(w http.ResponseWriter, r *http.Request, group, name string) {
-	b := s.backendOr501(w, "metrics")
-	if b == nil {
+	b, ok := backendOr501(w, "metrics", s.metricsBackend)
+	if !ok {
 		return
 	}
 	var (
@@ -1069,7 +1100,7 @@ func (s *Service) handleMetric(w http.ResponseWriter, r *http.Request, group, na
 	)
 	switch group {
 	case "realtime":
-		v, err = b.MetricRealtime(r.Context(), name)
+		v, err = b.MetricRealtime(r.Context(), name, r.URL.Query())
 	case "history":
 		v, err = b.MetricHistory(r.Context(), name)
 	default:
@@ -1090,8 +1121,8 @@ func (s *Service) handleMetric(w http.ResponseWriter, r *http.Request, group, na
 // ---------------------------------------------------------------------------
 
 func (s *Service) handleGeoIPStatus(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "geoip")
-	if b == nil {
+	b, ok := backendOr501(w, "geoip", s.geoBackend)
+	if !ok {
 		return
 	}
 	v, err := b.GeoIPStatus(r.Context())
@@ -1103,8 +1134,8 @@ func (s *Service) handleGeoIPStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleGeoIPLookup(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "geoip")
-	if b == nil {
+	b, ok := backendOr501(w, "geoip", s.geoBackend)
+	if !ok {
 		return
 	}
 	ip := r.URL.Query().Get("ip")
@@ -1121,8 +1152,8 @@ func (s *Service) handleGeoIPLookup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleGeoIPLookupPost(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "geoip")
-	if b == nil {
+	b, ok := backendOr501(w, "geoip", s.geoBackend)
+	if !ok {
 		return
 	}
 	var body struct {
@@ -1141,8 +1172,8 @@ func (s *Service) handleGeoIPLookupPost(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Service) handleGeoIPUpdateNow(w http.ResponseWriter, r *http.Request) {
-	b := s.backendOr501(w, "geoip")
-	if b == nil {
+	b, ok := backendOr501(w, "geoip", s.geoBackend)
+	if !ok {
 		return
 	}
 	if err := b.GeoIPUpdateNow(r.Context()); err != nil {

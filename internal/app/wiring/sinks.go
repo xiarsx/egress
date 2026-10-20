@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/xiarsx/egress/internal/adapters/sqlite"
+	"github.com/xiarsx/egress/internal/app/pipeline"
 	"github.com/xiarsx/egress/internal/ports"
+	pknode "github.com/xiarsx/egress/pkg/node"
 	pksignal "github.com/xiarsx/egress/pkg/signal"
 )
 
@@ -76,69 +78,61 @@ func (s *MetricsSink) consume(sig pksignal.Signal) {
 	}
 }
 
-// ProxyTypeUnknown marks request-log entries whose ingress kind the
-// Traffic signal does not carry. The signal vocabulary (spec/events.md)
-// has no proxy-type field yet; when it gains one, ReqLogSink should map
-// it to http-forward | reverse | socks5-forward instead of this default.
-const ProxyTypeUnknown = "unknown"
-
-// ReqLogSink turns Traffic signals into request-log entries (design §6.1,
-// spec/events.md §2) and appends them to the rolling request-log DBs.
-//
-// Fields the Traffic signal cannot provide (target, account, httpStatus,
-// stage, resinError, duration) are left zero-valued: filling them needs a
-// richer data-plane event (TODO, spec/events.md stable — any change goes
-// through an RFC).
-type ReqLogSink struct {
+// ReqLogWriter maps the pipeline's terminal request records
+// (spec/events.md §2) onto sqlite entries and appends them. Append is
+// non-blocking (bounded staging queue, shed-on-full), so Write is safe
+// for the pipeline's hot path.
+type ReqLogWriter struct {
 	Log *sqlite.ReqLog
 
 	// PlatformName maps a platform UUID to its wire-protocol name for the
 	// log's platform column. Nil ⇒ the UUID is logged as-is.
 	PlatformName func(id string) string
-
-	// ProxyType is stamped on every entry (see ProxyTypeUnknown).
-	ProxyType string
 }
 
-// Run consumes signals until ctx is done or sub is closed. Append is
-// non-blocking (bounded staging queue, shed-on-full); the writer loop
-// inside sqlite.ReqLog owns the disk flush cadence, with a final drain
-// on Close.
-func (s *ReqLogSink) Run(ctx context.Context, sub <-chan pksignal.Signal) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case sig, ok := <-sub:
-			if !ok {
-				return
-			}
-			if sig.Kind != pksignal.KindTraffic {
-				continue
-			}
-			s.Log.Append(s.entry(sig))
-		}
+// proxyTypeOf maps pipeline ingress identifiers to the spec's log values.
+func proxyTypeOf(proto string) string {
+	switch proto {
+	case pipeline.ProtoHTTPForward:
+		return "http-forward"
+	case pipeline.ProtoHTTPReverse:
+		return "reverse"
+	case pipeline.ProtoSOCKS5:
+		return "socks5-forward"
+	default:
+		return "unknown"
 	}
 }
 
-func (s *ReqLogSink) entry(sig pksignal.Signal) sqlite.ReqLogEntry {
-	platform := sig.PlatformID
-	if s.PlatformName != nil {
-		platform = s.PlatformName(sig.PlatformID)
+// Write converts and stages one request record. Non-blocking.
+func (w *ReqLogWriter) Write(rec ports.RequestLogRecord) {
+	// The pipeline already resolved the wire name; fall back to the ID
+	// only for pre-resolve failures (both empty then).
+	platform := rec.Platform
+	if platform == "" {
+		platform = rec.PlatformID
 	}
-	proxyType := s.ProxyType
-	if proxyType == "" {
-		proxyType = ProxyTypeUnknown
+	e := sqlite.ReqLogEntry{
+		TS:          rec.TS,
+		ProxyType:   proxyTypeOf(rec.ProxyType),
+		Platform:    platform,
+		Account:     rec.Account,
+		Target:      rec.Target,
+		NetOK:       rec.NetOK,
+		HTTPStatus:  rec.HTTPStatus,
+		Stage:       rec.Stage,
+		EgressError: rec.EgressError,
+		DurationMs:  rec.DurationMs,
+		BytesUp:     rec.BytesUp,
+		BytesDown:   rec.BytesDown,
 	}
-	return sqlite.ReqLogEntry{
-		TS:        sig.At,
-		ProxyType: proxyType,
-		Platform:  platform,
-		Node:      hex.EncodeToString(sig.NodeHash[:]),
-		NetOK:     sig.OK,
-		BytesUp:   int64(sig.BytesUp),
-		BytesDown: int64(sig.BytesDown),
+	if rec.NodeHash != (pknode.Hash{}) {
+		e.Node = hex.EncodeToString(rec.NodeHash[:])
 	}
+	if rec.EgressIP.IsValid() {
+		e.EgressIP = rec.EgressIP.String()
+	}
+	w.Log.Append(e)
 }
 
 // ScheduleCacheFlush arranges a periodic CacheStore.Flush via the

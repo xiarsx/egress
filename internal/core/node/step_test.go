@@ -1,6 +1,9 @@
 package node
 
 import (
+	"os"
+
+	"gopkg.in/yaml.v3"
 	"net/netip"
 	"testing"
 	"time"
@@ -22,55 +25,167 @@ func ipAddrZero() netip.Addr { return netip.Addr{} }
 // Mirrors spec/vectors/health_transition_vectors.yaml with
 // maxConsecutiveFailures = 3. Every row of the design §2.4 table is
 // covered, including the breaker-exempt and outbound-empty rows.
-func TestStep_TransitionTable(t *testing.T) {
+// TestStep_ConformanceVectors executes the transition table directly
+// from spec/vectors/health_transition_vectors.yaml (the spec is the
+// source of truth; no hand-mirrored copies).
+func TestStep_ConformanceVectors(t *testing.T) {
+	cfg := BreakerConfig{MaxConsecutiveFailures: 3}
+	now := time.Date(2026, 10, 17, 13, 0, 0, 0, time.UTC)
+
+	for _, v := range loadHealthVectors(t) {
+		t.Run(v.Name, func(t *testing.T) {
+			// node_added is the constructor row, not a transition.
+			if v.Signal.Kind == yaml.ScalarNode && v.Signal.Value == "node_added" {
+				if v.Expect.Health != "probing" {
+					t.Fatalf("node_added expect = %+v", v.Expect)
+				}
+				if got := ProbingHealth(); got.Kind != HealthProbing {
+					t.Fatalf("ProbingHealth() = %+v", got)
+				}
+				return
+			}
+
+			sig := v.signalKind(t)
+			got := Step(v.currentHealth(t), sig, cfg, now)
+			want := v.expectHealth(t)
+			if got.Kind != want.Kind || got.Failures != want.Failures {
+				t.Fatalf("Step = %+v, want %+v (yaml)", got, want)
+			}
+			// Staying tripped preserves the original since.
+			if v.Current.Health == "tripped" && got.Kind == HealthTripped {
+				if !got.Since.Equal(v.currentHealth(t).Since) {
+					t.Fatalf("tripped since = %v, want preserved %v", got.Since, v.Current.Health)
+				}
+			}
+		})
+	}
+}
+
+// Supplementary transitions the yaml does not cover.
+func TestStep_SupplementaryTransitions(t *testing.T) {
 	cfg := BreakerConfig{MaxConsecutiveFailures: 3}
 	now := time.Date(2026, 10, 17, 13, 0, 0, 0, time.UTC)
 	trippedSince := time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC)
 
-	tests := []struct {
+	for _, tc := range []struct {
 		name string
 		cur  Health
 		sig  pksignal.SignalKind
 		want Health
 	}{
-		// Probing / Tripped + ok → Healthy(0)
-		{"probing_ok_becomes_healthy", ProbingHealth(), pksignal.SignalOK, HealthyHealth(0)},
-		{"tripped_ok_becomes_healthy", TrippedHealth(trippedSince), pksignal.SignalOK, HealthyHealth(0)},
-
-		// Probing + fail → Probing
-		{"probing_fail_stays_probing", ProbingHealth(), pksignal.SignalFail, ProbingHealth()},
-
-		// Healthy(n) + ok → Healthy(0)
-		{"healthy_ok_resets_counter", HealthyHealth(2), pksignal.SignalOK, HealthyHealth(0)},
-
-		// Healthy(n) + fail, n+1 < threshold → Healthy(n+1)
-		{"healthy_fail_increments", HealthyHealth(0), pksignal.SignalFail, HealthyHealth(1)},
-		{"healthy_fail_increments_2", HealthyHealth(1), pksignal.SignalFail, HealthyHealth(2)},
-
-		// Healthy(n) + fail, n+1 >= threshold → Tripped(now)
-		{"healthy_fail_trips_at_threshold", HealthyHealth(2), pksignal.SignalFail, TrippedHealth(now)},
-
-		// Tripped + fail → Tripped (only ok recovers; probes keep flowing)
 		{"tripped_fail_stays_tripped", TrippedHealth(trippedSince), pksignal.SignalFail, TrippedHealth(trippedSince)},
-
-		// fail + breakerExempt → unchanged, on every state
-		{"exempt_fail_healthy_unchanged", HealthyHealth(2), pksignal.SignalFailExempt, HealthyHealth(2)},
-		{"exempt_fail_probing_unchanged", ProbingHealth(), pksignal.SignalFailExempt, ProbingHealth()},
-		{"exempt_fail_tripped_unchanged", TrippedHealth(trippedSince), pksignal.SignalFailExempt, TrippedHealth(trippedSince)},
-
-		// Outbound empty → unchanged (projector maps these to SignalIgnored)
-		{"ignored_fail_healthy_unchanged", HealthyHealth(1), pksignal.SignalIgnored, HealthyHealth(1)},
 		{"ignored_ok_probing_unchanged", ProbingHealth(), pksignal.SignalIgnored, ProbingHealth()},
 		{"ignored_ok_tripped_unchanged", TrippedHealth(trippedSince), pksignal.SignalIgnored, TrippedHealth(trippedSince)},
-	}
-
-	for _, tc := range tests {
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := Step(tc.cur, tc.sig, cfg, now)
-			if got.Kind != tc.want.Kind || got.Failures != tc.want.Failures || !got.Since.Equal(tc.want.Since) {
-				t.Fatalf("Step(%+v, %v) = %+v, want %+v", tc.cur, tc.sig, got, tc.want)
+			if got := Step(tc.cur, tc.sig, cfg, now); got != tc.want {
+				t.Fatalf("Step = %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- yaml loader (spec/vectors is the normative conformance source) ---
+
+type healthVectorFile struct {
+	Config struct {
+		MaxConsecutiveFailures int `yaml:"maxConsecutiveFailures"`
+	} `yaml:"config"`
+	Vectors []healthVector `yaml:"vectors"`
+}
+
+type healthVector struct {
+	Name    string      `yaml:"name"`
+	Current healthState `yaml:"current"`
+	Signal  yaml.Node   `yaml:"signal"`
+	Expect  healthState `yaml:"expect"`
+}
+
+type healthState struct {
+	Health   string `yaml:"health"`
+	Failures int    `yaml:"failures"`
+	Since    string `yaml:"since"`
+}
+
+func loadHealthVectors(t *testing.T) []healthVector {
+	t.Helper()
+	raw, err := os.ReadFile("../../../spec/vectors/health_transition_vectors.yaml")
+	if err != nil {
+		t.Fatalf("read vectors: %v", err)
+	}
+	var f healthVectorFile
+	if err := yaml.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse vectors: %v", err)
+	}
+	if f.Config.MaxConsecutiveFailures != 3 {
+		t.Fatalf("yaml threshold = %d; the executor hardcodes 3 — keep them in sync", f.Config.MaxConsecutiveFailures)
+	}
+	if len(f.Vectors) == 0 {
+		t.Fatal("no vectors loaded")
+	}
+	return f.Vectors
+}
+
+func (hs healthState) toHealth(t *testing.T) Health {
+	t.Helper()
+	since, err := time.Parse(time.RFC3339, orEpoch(hs.Since))
+	if err != nil {
+		t.Fatalf("bad since %q: %v", hs.Since, err)
+	}
+	switch hs.Health {
+	case "", "probing":
+		return ProbingHealth()
+	case "healthy":
+		return HealthyHealth(hs.Failures)
+	case "tripped":
+		return TrippedHealth(since)
+	default:
+		t.Fatalf("unknown health %q", hs.Health)
+		return Health{}
+	}
+}
+
+func orEpoch(s string) string {
+	if s == "" {
+		return "1970-01-01T00:00:00Z"
+	}
+	return s
+}
+
+func (v healthVector) currentHealth(t *testing.T) Health { return v.Current.toHealth(t) }
+func (v healthVector) expectHealth(t *testing.T) Health  { return v.Expect.toHealth(t) }
+
+// signalKind maps the yaml signal (scalar or map with flags) to the
+// kernel's signal kind.
+func (v healthVector) signalKind(t *testing.T) pksignal.SignalKind {
+	t.Helper()
+	if v.Signal.Kind == yaml.ScalarNode {
+		switch v.Signal.Value {
+		case "ok":
+			return pksignal.SignalOK
+		case "fail":
+			return pksignal.SignalFail
+		}
+		t.Fatalf("unknown scalar signal %q", v.Signal.Value)
+	}
+	var s struct {
+		Kind          string `yaml:"kind"`
+		BreakerExempt bool   `yaml:"breakerExempt"`
+		OutboundEmpty bool   `yaml:"outboundEmpty"`
+	}
+	if err := v.Signal.Decode(&s); err != nil {
+		t.Fatalf("decode signal: %v", err)
+	}
+	if s.Kind != "fail" {
+		t.Fatalf("unknown signal kind %q", s.Kind)
+	}
+	switch {
+	case s.OutboundEmpty:
+		return pksignal.SignalIgnored
+	case s.BreakerExempt:
+		return pksignal.SignalFailExempt
+	default:
+		return pksignal.SignalFail
 	}
 }
 

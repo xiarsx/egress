@@ -1,6 +1,9 @@
-package config
-
-// In-memory ports.Store for config package tests.
+// Package memstore is the shared in-memory ports.Store for unit tests
+// (test-only; the production store is the sqlite adapter). It enforces
+// the same contract the sqlite store does: optimistic versioning,
+// ErrNotFound / ErrAlreadyExists / ErrConflict / ErrInvalid semantics
+// and RFC 7386 merge-patch.
+package memstore
 
 import (
 	"context"
@@ -12,26 +15,31 @@ import (
 	"github.com/xiarsx/egress/internal/ports"
 )
 
-type memStore struct {
+// Store is an in-memory ports.Store. It is safe for concurrent use.
+type Store struct {
 	mu      sync.Mutex
 	items   map[ports.Kind]map[string]ports.Resource
 	version int64
 }
 
-func newMemStore() *memStore {
-	return &memStore{items: map[ports.Kind]map[string]ports.Resource{}}
+// New creates an empty Store.
+func New() *Store {
+	return &Store{items: map[ports.Kind]map[string]ports.Resource{}}
 }
 
-func (m *memStore) Get(_ context.Context, kind ports.Kind, name string) (ports.Resource, error) {
+var _ ports.Store = (*Store)(nil)
+
+func (m *Store) Get(_ context.Context, kind ports.Kind, name string) (ports.Resource, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.items[kind][name]; ok {
-		return r, nil
+	r, ok := m.items[kind][name]
+	if !ok {
+		return ports.Resource{}, fmt.Errorf("%w: %s/%s", ports.ErrNotFound, kind, name)
 	}
-	return ports.Resource{}, fmt.Errorf("%w: %s/%s", ports.ErrNotFound, kind, name)
+	return r, nil
 }
 
-func (m *memStore) List(_ context.Context, kind ports.Kind, opts ports.ListOptions) (ports.Page, error) {
+func (m *Store) List(_ context.Context, kind ports.Kind, opts ports.ListOptions) (ports.Page, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var all []ports.Resource
@@ -50,9 +58,12 @@ func (m *memStore) List(_ context.Context, kind ports.Kind, opts ports.ListOptio
 	return ports.Page{Items: all[opts.Offset:end], Total: total, Limit: opts.Limit, Offset: opts.Offset}, nil
 }
 
-func (m *memStore) Create(_ context.Context, r ports.Resource) error {
+func (m *Store) Create(_ context.Context, r ports.Resource) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if r.Kind == "" || r.Name == "" || len(r.Data) == 0 {
+		return fmt.Errorf("%w: empty kind/name/data", ports.ErrInvalid)
+	}
 	if m.items[r.Kind] == nil {
 		m.items[r.Kind] = map[string]ports.Resource{}
 	}
@@ -65,7 +76,7 @@ func (m *memStore) Create(_ context.Context, r ports.Resource) error {
 	return nil
 }
 
-func (m *memStore) Update(_ context.Context, r ports.Resource) error {
+func (m *Store) Update(_ context.Context, r ports.Resource) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.items[r.Kind][r.Name]
@@ -81,7 +92,7 @@ func (m *memStore) Update(_ context.Context, r ports.Resource) error {
 	return nil
 }
 
-func (m *memStore) Delete(_ context.Context, kind ports.Kind, name string) error {
+func (m *Store) Delete(_ context.Context, kind ports.Kind, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.items[kind][name]; !ok {
@@ -91,7 +102,8 @@ func (m *memStore) Delete(_ context.Context, kind ports.Kind, name string) error
 	return nil
 }
 
-func (m *memStore) Patch(_ context.Context, kind ports.Kind, name string, patch []byte) (ports.Resource, error) {
+// Patch applies an RFC 7386 JSON merge-patch to the resource Data.
+func (m *Store) Patch(_ context.Context, kind ports.Kind, name string, patch []byte) (ports.Resource, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.items[kind][name]
@@ -104,7 +116,7 @@ func (m *memStore) Patch(_ context.Context, kind ports.Kind, name string, patch 
 	}
 	var p map[string]any
 	if err := json.Unmarshal(patch, &p); err != nil {
-		return ports.Resource{}, err
+		return ports.Resource{}, fmt.Errorf("%w: bad merge-patch: %v", ports.ErrInvalid, err)
 	}
 	merged := mergePatch(doc, p)
 	data, err := json.Marshal(merged)

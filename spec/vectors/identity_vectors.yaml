@@ -7,24 +7,24 @@ vectors:
   # --- 正向代理 user:pass 整体（先按最右 ":" 切 Token） ---
   - name: forward_basic_full
     entry: http-forward
-    credential: "Nimbus.Tom:resin-123456"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "Tom" }
+    credential: "Nimbus.Tom:egress-123456"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "Tom" }
   - name: forward_basic_empty_platform
     entry: http-forward
-    credential: ".Tom:resin-123456"
-    expect: { token: "resin-123456", platform: "", account: "Tom" }
+    credential: ".Tom:egress-123456"
+    expect: { token: "egress-123456", platform: "", account: "Tom" }
   - name: forward_basic_empty_account
     entry: http-forward
-    credential: "Nimbus:resin-123456"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "" }
+    credential: "Nimbus:egress-123456"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "" }
   - name: forward_basic_trailing_dot
     entry: http-forward
-    credential: "Nimbus.:resin-123456"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "" }
+    credential: "Nimbus.:egress-123456"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "" }
   - name: forward_basic_account_with_colon
     entry: http-forward
-    credential: "MyHub.bEA:234:resin-123456"
-    expect: { token: "resin-123456", platform: "MyHub", account: "bEA:234" }
+    credential: "MyHub.bEA:234:egress-123456"
+    expect: { token: "egress-123456", platform: "MyHub", account: "bEA:234" }
   - name: forward_credential_empty
     entry: http-forward
     credential: ""
@@ -117,43 +117,43 @@ vectors:
     entry: socks5
     method: "0x02"
     username: "Nimbus.Tom"
-    password: "resin-123456"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "Tom" }
+    password: "egress-123456"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "Tom" }
   - name: socks5_empty_account
     entry: socks5
     method: "0x02"
     username: "Nimbus"
-    password: "resin-123456"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "" }
+    password: "egress-123456"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "" }
   - name: socks5_account_with_colon
     entry: socks5
     method: "0x02"
     username: "MyHub.bEA:234"
-    password: "resin-123456"
-    expect: { token: "resin-123456", platform: "MyHub", account: "bEA:234" }
+    password: "egress-123456"
+    expect: { token: "egress-123456", platform: "MyHub", account: "bEA:234" }
 
   # --- 反向代理路径（/TOKEN/identity/proto/host/...；身份段先 Path Segment 解码） ---
   - name: reverse_full
     entry: reverse
-    path: "/resin-123456/Nimbus.Tom/https/example.com/p"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "Tom", proto: "https", host: "example.com" }
+    path: "/egress-123456/Nimbus.Tom/https/example.com/p"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "Tom", proto: "https", host: "example.com" }
   - name: reverse_empty_platform
     entry: reverse
-    path: "/resin-123456/.Tom/https/example.com/p"
-    expect: { token: "resin-123456", platform: "", account: "Tom", proto: "https", host: "example.com" }
+    path: "/egress-123456/.Tom/https/example.com/p"
+    expect: { token: "egress-123456", platform: "", account: "Tom", proto: "https", host: "example.com" }
   - name: reverse_empty_account
     entry: reverse
-    path: "/resin-123456/Nimbus/https/example.com/p"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "", proto: "https", host: "example.com" }
+    path: "/egress-123456/Nimbus/https/example.com/p"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "", proto: "https", host: "example.com" }
   - name: reverse_trailing_dot
     entry: reverse
-    path: "/resin-123456/Nimbus./https/example.com/p"
-    expect: { token: "resin-123456", platform: "Nimbus", account: "", proto: "https", host: "example.com" }
+    path: "/egress-123456/Nimbus./https/example.com/p"
+    expect: { token: "egress-123456", platform: "Nimbus", account: "", proto: "https", host: "example.com" }
   - name: reverse_account_with_colon
     entry: reverse
-    path: "/resin-123456/MyHub.bEA:234/https/example.com/p"
-    expect: { token: "resin-123456", platform: "MyHub", account: "bEA:234", proto: "https", host: "example.com" }
+    path: "/egress-123456/MyHub.bEA:234/https/example.com/p"
+    expect: { token: "egress-123456", platform: "MyHub", account: "bEA:234", proto: "https", host: "example.com" }
   - name: reverse_percent_encoded_identity
     entry: reverse
-    path: "/resin-123456/MyHub.ops%2Fprod%3Feu%231/https/example.com/p"
-    expect: { token: "resin-123456", platform: "MyHub", account: "ops/prod?eu#1", proto: "https", host: "example.com" }
+    path: "/egress-123456/MyHub.ops%2Fprod%3Feu%231/https/example.com/p"
+    expect: { token: "egress-123456", platform: "MyHub", account: "ops/prod?eu#1", proto: "https", host: "example.com" }

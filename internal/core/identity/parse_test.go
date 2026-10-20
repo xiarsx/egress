@@ -2,92 +2,107 @@ package identity
 
 import (
 	"errors"
+	"os"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
-// Credential-level vectors: subset of spec/vectors/identity_vectors.yaml
-// (entry: http-forward). Platform "" means "use Default" at a higher
-// layer; Parse itself reports the raw split.
-func TestParse_CredentialVectors(t *testing.T) {
-	tests := []struct {
-		name     string
-		raw      string
-		platform string
-		account  string
-		token    string
-	}{
-		{"forward_basic_full", "Nimbus.Tom:resin-123456", "Nimbus", "Tom", "resin-123456"},
-		{"forward_basic_empty_platform", ".Tom:resin-123456", "", "Tom", "resin-123456"},
-		{"forward_basic_empty_account", "Nimbus:resin-123456", "Nimbus", "", "resin-123456"},
-		{"forward_basic_trailing_dot", "Nimbus.:resin-123456", "Nimbus", "", "resin-123456"},
-		{"forward_basic_account_with_colon", "MyHub.bEA:234:resin-123456", "MyHub", "bEA:234", "resin-123456"},
-		{"forward_credential_empty", "", "", "", ""},
-		{"forward_credential_bare_platform", "a", "a", "", ""},
-		{"forward_credential_lone_colon", ":", "", "", ""},
-		{"forward_credential_dot_colon", ".:", "", "", ""},
-		{"forward_credential_colon_dot", ":.", "", "", "."},
-		{"forward_credential_dot_b_colon", ".b:", "", "b", ""},
-		{"forward_credential_dot_colon_c", ".:c", "", "", "c"},
-		{"forward_credential_double_colon", ".::c", "", ":", "c"},
-		{"forward_credential_double_dot", "..:", "", ".", ""},
-		{"forward_credential_a_dot_b_colon_c", "a.b:c", "a", "b", "c"},
-		// first '.' wins over a later ':'
-		{"dot_before_colon", "MyHub.ops:prod:tok", "MyHub", "ops:prod", "tok"},
-		// first ':' wins over a later '.'
-		{"colon_before_dot", "MyHub:ops.prod:tok", "MyHub", "ops.prod", "tok"},
+// Credential + identity vectors: executed directly from
+// spec/vectors/identity_vectors.yaml (the spec is the source of truth;
+// no hand-mirrored copies).
+func TestParse_ConformanceVectors(t *testing.T) {
+	vectors := loadIdentityVectors(t)
+	if len(vectors) == 0 {
+		t.Fatal("no vectors loaded — spec/vectors/identity_vectors.yaml missing?")
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := Parse(tc.raw)
-			if err != nil {
-				t.Fatalf("Parse(%q) error: %v", tc.raw, err)
-			}
-			// Empty platform is normalized to Default by Parse.
-			wantPlatform := tc.platform
-			if wantPlatform == "" {
-				wantPlatform = DefaultPlatformID
-			}
-			if got.PlatformID != wantPlatform || got.Account != tc.account || got.Token != tc.token {
-				t.Fatalf("Parse(%q) = %+v, want platform=%q account=%q token=%q",
-					tc.raw, got, wantPlatform, tc.account, tc.token)
-			}
-			if got.Random != (tc.account == "") {
-				t.Fatalf("Parse(%q).Random = %v, want %v", tc.raw, got.Random, tc.account == "")
+	for _, v := range vectors {
+		t.Run(v.Name, func(t *testing.T) {
+			switch v.Entry {
+			case "http-forward":
+				id, err := Parse(v.Credential)
+				if err != nil {
+					t.Fatalf("Parse(%q): %v", v.Credential, err)
+				}
+				// spec/identity.md §2: 空 platform 表示"用 Default" —
+				// the vector keeps the raw split, Parse normalizes.
+				wantPlatform := v.Expect.Platform
+				if wantPlatform == "" {
+					wantPlatform = DefaultPlatformID
+				}
+				if id.Token != v.Expect.Token || id.PlatformID != wantPlatform || id.Account != v.Expect.Account {
+					t.Fatalf("Parse(%q) = (%q, %q, %q), want (%q, %q, %q)",
+						v.Credential, id.Token, id.PlatformID, id.Account,
+						v.Expect.Token, wantPlatform, v.Expect.Account)
+				}
+			case "identity-only":
+				platform, account := SplitIdentity(v.Identity)
+				if platform != v.Expect.Platform || account != v.Expect.Account {
+					t.Fatalf("SplitIdentity(%q) = (%q, %q), want (%q, %q)",
+						v.Identity, platform, account, v.Expect.Platform, v.Expect.Account)
+				}
+			case "socks5":
+				// RFC1929: username 整串即身份（无最右切分），password 即 Token。
+				platform, account := SplitIdentity(v.Username)
+				wantPlatform := v.Expect.Platform
+				if wantPlatform == "" {
+					wantPlatform = DefaultPlatformID
+				}
+				if platform != wantPlatform || account != v.Expect.Account || v.Password != v.Expect.Token {
+					t.Fatalf("socks5 (%q, %q) split = (%q, %q, %q), want (%q, %q, %q)",
+						v.Username, v.Password, platform, account, v.Password,
+						wantPlatform, v.Expect.Account, v.Expect.Token)
+				}
+			case "reverse":
+				// Executed by the reverse adapter's own YAML consumer
+				// (internal/adapters/reverse): the path grammar lives
+				// there, not in the identity kernel.
+			default:
+				t.Fatalf("unknown vector entry %q — extend the executor", v.Entry)
 			}
 		})
 	}
 }
 
-// Identity-only vectors (entry: identity-only): the bare identity split
-// used by the reverse-proxy path after path-segment decoding.
-func TestSplitIdentity_Vectors(t *testing.T) {
-	tests := []struct {
-		name     string
-		identity string
-		platform string
-		account  string
-	}{
-		{"identity_empty", "", "", ""},
-		{"identity_lone_colon", ":", "", ""},
-		{"identity_lone_dot", ".", "", ""},
-		{"identity_bare", "a", "a", ""},
-		{"identity_trailing_colon", "a:", "a", ""},
-		{"identity_leading_colon", ":b", "", "b"},
-		{"identity_dot_colon", ".:", "", ":"},
-		{"identity_colon_dot", ":.", "", "."},
-		{"identity_colon_dotdot", ":..", "", ".."},
-		{"identity_colon_split", "a:b", "a", "b"},
-		{"identity_first_dot_wins_over_later_colon", "MyHub.ops:prod", "MyHub", "ops:prod"},
+// --- yaml loader (spec/vectors is the normative conformance source) ---
+
+type identityVectorFile struct {
+	Version int              `yaml:"version"`
+	Vectors []identityVector `yaml:"vectors"`
+}
+
+type identityVector struct {
+	Name       string `yaml:"name"`
+	Entry      string `yaml:"entry"`
+	Credential string `yaml:"credential"`
+	Identity   string `yaml:"identity"`
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
+	Expect     struct {
+		Token    string `yaml:"token"`
+		Platform string `yaml:"platform"`
+		Account  string `yaml:"account"`
+	} `yaml:"expect"`
+}
+
+func loadIdentityVectors(t *testing.T) []identityVector {
+	t.Helper()
+	raw, err := os.ReadFile("../../../spec/vectors/identity_vectors.yaml")
+	if err != nil {
+		t.Fatalf("read vectors: %v", err)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			platform, account := SplitIdentity(tc.identity)
-			if platform != tc.platform || account != tc.account {
-				t.Fatalf("SplitIdentity(%q) = (%q, %q), want (%q, %q)",
-					tc.identity, platform, account, tc.platform, tc.account)
-			}
-		})
+	var f identityVectorFile
+	if err := yaml.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse vectors: %v", err)
 	}
+	seen := map[string]bool{}
+	for _, v := range f.Vectors {
+		if seen[v.Name] {
+			t.Fatalf("duplicate vector name %q", v.Name)
+		}
+		seen[v.Name] = true
+	}
+	return f.Vectors
 }
 
 func TestParse_EmptyAccountMarksRandom(t *testing.T) {
@@ -110,7 +125,7 @@ func TestParse_EmptyAccountMarksRandom(t *testing.T) {
 }
 
 func TestValidateToken(t *testing.T) {
-	valid := []string{"resin-123456", "abcDEF019_-", "x", ""}
+	valid := []string{"egress-123456", "abcDEF019_-", "x", ""}
 	for _, tok := range valid {
 		if err := ValidateToken(tok); err != nil {
 			t.Fatalf("ValidateToken(%q) = %v, want nil", tok, err)

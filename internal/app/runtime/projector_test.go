@@ -59,6 +59,27 @@ func (f *fakeRegistry) UpdateHealth(h pknode.Hash, health pknode.Health) {
 		f.nodes[h] = n
 	}
 }
+
+func (f *fakeRegistry) UpdateEgressIP(h pknode.Hash, ip netip.Addr) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if n, ok := f.nodes[h]; ok {
+		n.EgressIP = ip
+		f.nodes[h] = n
+	}
+}
+
+func (f *fakeRegistry) UpdateLatency(h pknode.Hash, latency time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if n, ok := f.nodes[h]; ok {
+		n.Latency, n.HasLatency = latency, true
+		f.nodes[h] = n
+	}
+}
+
+func (f *fakeRegistry) UpdateAttrs(pknode.Hash, map[pknode.AttrKey]pknode.AttrValue) {}
+func (f *fakeRegistry) SetOnNodeChange(func(h pknode.Hash, removed bool))            {}
 func (f *fakeRegistry) Get(h pknode.Hash) (pknode.NodeSnapshot, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

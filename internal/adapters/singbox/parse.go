@@ -1,9 +1,7 @@
 // Package singbox parses proxy subscriptions into outbounds and dials
 // through them.
 //
-// Parsing mirrors the reference implementation
-// (~/workspace/resin-reference/internal/subscription, verbatim logic in
-// refparse.go): base64-wrapped content is unwrapped first, then sing-box
+// Parsing pipeline: base64-wrapped content is unwrapped first, then sing-box
 // JSON ({"outbounds":[...]} or a bare array), Clash JSON/YAML
 // ({"proxies":[...]} / proxies:), Surge ([Proxy] sections), URI lines and
 // finally plain IP:PORT[:USER:PASS] text lines. Each line is parsed
@@ -27,11 +25,11 @@ import (
 
 // Outbound is one parsed proxy outbound: a dialable proxy chain endpoint.
 //
-// DialContext dials network/address through the proxy. Direct, HTTP(S)
-// CONNECT and SOCKS5 outbounds are dialed natively; every other type
-// (vmess, vless, trojan, shadowsocks, hysteria2, ...) returns
-// ErrUnsupportedOutbound until a native or sing-box-backed implementation
-// lands (see dial.go).
+// DialContext dials network/address through the proxy via the embedded
+// sing-box outbound engine (engine.go): vmess, vless (incl. REALITY),
+// trojan, shadowsocks, socks, http, direct, …; QUIC protocols need
+// `-tags with_quic`, REALITY needs `-tags with_utls`. Types without a
+// constructor fail closed with ErrUnsupportedOutbound (see dial.go).
 type Outbound interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 	// RawOptions returns the canonicalized sing-box outbound JSON without

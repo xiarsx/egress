@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xiarsx/egress/internal/ports"
+	"github.com/xiarsx/egress/pkg/ext"
 	pknode "github.com/xiarsx/egress/pkg/node"
 )
 
@@ -283,5 +284,52 @@ func TestSyncer_UnknownKind(t *testing.T) {
 	waitFor(t, func() bool { return s.LastError("weird") != "" }, "unknown kind error")
 	if len(reg.All()) != 0 {
 		t.Fatal("no snapshot expected for unknown kind")
+	}
+}
+
+// --- ext.SourceProvider fallback (spec/ext-abi.md §2, RFC-0002) ---
+
+type stubSourceProvider struct {
+	fetched chan string
+}
+
+func (p *stubSourceProvider) Name() string { return "stubsrc" }
+func (p *stubSourceProvider) Fetch(ctx context.Context, spec ext.SourceSpec) ([]pknode.NodeSnapshot, error) {
+	select {
+	case p.fetched <- spec.Name + "|" + spec.Kind + "|" + spec.URL:
+	default:
+	}
+	return []pknode.NodeSnapshot{{
+		Hash:        pknode.Hash{7, 7, 7},
+		HasOutbound: true,
+		Tags:        []pknode.ScopedTag{"edge"},
+		Health:      pknode.HealthyHealth(0),
+	}}, nil
+}
+
+func TestSyncer_ExtSourceProviderFallback(t *testing.T) {
+	prov := &stubSourceProvider{fetched: make(chan string, 1)}
+	ext.RegisterSourceProvider(prov)
+
+	reg := NewRegistry()
+	s := NewSyncer(reg, &fakeFetcher{}, &fakeScheduler{}, testParse)
+	s.AddSource(ports.SourceSpec{
+		Name: "custom", Kind: "stubsrc", URL: "stub://feed", UpdateInterval: time.Hour,
+	})
+	select {
+	case got := <-prov.fetched:
+		if got != "custom|stubsrc|stub://feed" {
+			t.Fatalf("provider spec = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ext provider never called")
+	}
+	waitFor(t, func() bool { return len(reg.All()) == 1 }, "snapshot published")
+	if s.LastError("custom") != "" {
+		t.Fatalf("LastError = %q", s.LastError("custom"))
+	}
+	n := reg.All()[0]
+	if n.Hash != (pknode.Hash{7, 7, 7}) || len(n.Tags) != 1 || string(n.Tags[0]) != "custom/edge" {
+		t.Fatalf("node = %+v, want provider snapshot with source-scoped tags", n)
 	}
 }

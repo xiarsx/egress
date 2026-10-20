@@ -3,12 +3,13 @@ package ports
 import (
 	"context"
 	"net"
+	"net/netip"
 	"time"
 
-	pklease "github.com/xiarsx/egress/pkg/lease"
-	pknode "github.com/xiarsx/egress/pkg/node"
 	"github.com/xiarsx/egress/internal/core/identity"
 	"github.com/xiarsx/egress/internal/core/predicate"
+	pklease "github.com/xiarsx/egress/pkg/lease"
+	pknode "github.com/xiarsx/egress/pkg/node"
 )
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,11 @@ type PlatformSpec struct {
 	Filter    predicate.Filter
 	Policy    identity.Policy
 	StickyTTL time.Duration
+	// Allocation is the control-plane allocation string ("BALANCED" |
+	// "PREFER_LOW_LATENCY" | "PREFER_IDLE_IP"); empty means BALANCED.
+	Allocation string
+	// PassiveBreaker is "on" | "off"; empty means "on".
+	PassiveBreaker string
 }
 
 // PlatformSource 供运行时按 UUID 获取平台编译输入（P5 的 control.Service 实现）。
@@ -73,6 +79,21 @@ type NodeRegistry interface {
 	SnapshotOf(source string) []pknode.NodeSnapshot
 	// UpdateHealth 更新节点健康（唯一写入者：HealthProjector）。
 	UpdateHealth(h pknode.Hash, health pknode.Health)
+	// UpdateEgressIP records the egress IP learned by an egress probe
+	// (single writer: HealthProjector). Without it the registry image has
+	// no IP: views, sticky leases and geo enrichment all starve.
+	UpdateEgressIP(h pknode.Hash, ip netip.Addr)
+	// UpdateLatency records a learned latency sample (single writer:
+	// HealthProjector). Routable requires HasLatency; without this the
+	// registry image never marks a node latency-known.
+	UpdateLatency(h pknode.Hash, latency time.Duration)
+	// UpdateAttrs merges learned attributes (geo/ext providers; single
+	// writer: the attribute refresh loop).
+	UpdateAttrs(h pknode.Hash, attrs map[pknode.AttrKey]pknode.AttrValue)
+	// SetOnNodeChange registers the single change observer (the view
+	// deriver): fired after a node is added/updated (removed=false) or
+	// removed (removed=true), outside the registry lock.
+	SetOnNodeChange(fn func(h pknode.Hash, removed bool))
 	// Get/All 读快照。
 	Get(h pknode.Hash) (pknode.NodeSnapshot, bool)
 	All() []pknode.NodeSnapshot

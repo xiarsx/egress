@@ -1,6 +1,10 @@
 package predicate
 
 import (
+	"fmt"
+	"strings"
+
+	"github.com/xiarsx/egress/pkg/ext"
 	"testing"
 
 	pknode "github.com/xiarsx/egress/pkg/node"
@@ -231,5 +235,67 @@ func TestCombined_TagsAndAttrs(t *testing.T) {
 	n.Attrs["geo.country"] = pknode.StringAttr("us")
 	if p(n) {
 		t.Fatal("expected attr side to reject")
+	}
+}
+
+// --- ext.PredicateFactory delegation (spec/ext-abi.md §2, RFC-0002) ---
+
+type stubPredicateFactory struct{ gotArgs map[string]string }
+
+func (f *stubPredicateFactory) Name() string { return "stubpf" }
+func (f *stubPredicateFactory) Compile(args map[string]string) (func(ext.Attrs) bool, error) {
+	f.gotArgs = args
+	// Keep nodes whose "score" attr >= args["gte"].
+	return func(attrs ext.Attrs) bool {
+		v, ok := attrs["ext.stubpf.score"]
+		if !ok {
+			return false
+		}
+		return v.Str >= args["gte"]
+	}, nil
+}
+
+type failingPredicateFactory struct{}
+
+func (failingPredicateFactory) Name() string { return "failpf" }
+func (failingPredicateFactory) Compile(map[string]string) (func(ext.Attrs) bool, error) {
+	return nil, fmt.Errorf("boom")
+}
+
+func TestAttrs_ExtFactoryDelegation(t *testing.T) {
+	factory := &stubPredicateFactory{}
+	ext.RegisterPredicateFactory(factory)
+	ext.RegisterPredicateFactory(failingPredicateFactory{})
+
+	pred, err := Compile(Filter{Attrs: map[string]AttrCondition{
+		"ext.stubpf": GteIs("10"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if factory.gotArgs["gte"] != "10" {
+		t.Fatalf("factory args = %v", factory.gotArgs)
+	}
+	keep := pknode.NodeSnapshot{Attrs: map[pknode.AttrKey]pknode.AttrValue{"ext.stubpf.score": pknode.StringAttr("20")}}
+	drop := pknode.NodeSnapshot{Attrs: map[pknode.AttrKey]pknode.AttrValue{"ext.stubpf.score": pknode.StringAttr("05")}}
+	missing := pknode.NodeSnapshot{}
+	if !pred(keep) || pred(drop) || pred(missing) {
+		t.Fatalf("delegation: keep=%v drop=%v missing=%v", pred(keep), pred(drop), pred(missing))
+	}
+}
+
+func TestAttrs_ExtFactoryUnregisteredIsCompileError(t *testing.T) {
+	if _, err := Compile(Filter{Attrs: map[string]AttrCondition{
+		"ext.never-registered": GteIs("1"),
+	}}); err == nil {
+		t.Fatal("unregistered ext factory must be a Compile-time error (fail-closed)")
+	}
+}
+
+func TestAttrs_ExtFactoryCompileErrorPropagates(t *testing.T) {
+	if _, err := Compile(Filter{Attrs: map[string]AttrCondition{
+		"ext.failpf": GteIs("1"),
+	}}); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want factory compile error", err)
 	}
 }

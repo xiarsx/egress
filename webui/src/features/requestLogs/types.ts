@@ -1,70 +1,41 @@
-export type RequestLogItem = {
+// 与后端契约一致（internal/app/control RequestLogEntry）。
+// 负载（payloads）抓取后端未实现，前端不提供对应 UI。
+
+export interface RequestLogEntry {
+  /** 跨滚动文件的唯一标识（"seq:id"）。 */
   id: string;
-  ts: string;
-  proxy_type: number;
-  client_ip: string;
-  platform_id: string;
-  platform_name: string;
+  ts_ns: number;
+  /** "http-forward" | "reverse" | "socks5-forward" | "unknown" */
+  proxy_type: string;
+  platform: string;
   account: string;
-  target_host: string;
-  target_url: string;
-  node_hash: string;
-  node_tag: string;
+  target: string;
+  node: string;
   egress_ip: string;
-  duration_ms: number;
-  first_byte_duration_ms: number;
   net_ok: boolean;
-  http_method: string;
   http_status: number;
-  resin_error: string;
-  upstream_stage: string;
-  upstream_err_kind: string;
-  upstream_errno: string;
-  upstream_err_msg: string;
-  ingress_bytes: number;
-  egress_bytes: number;
-  payload_present: boolean;
-  req_headers_len: number;
-  req_body_len: number;
-  resp_headers_len: number;
-  resp_body_len: number;
-  req_headers_truncated: boolean;
-  req_body_truncated: boolean;
-  resp_headers_truncated: boolean;
-  resp_body_truncated: boolean;
-};
+  stage: string;
+  egress_error: string;
+  duration_ms: number;
+  bytes_up: number;
+  bytes_down: number;
+}
 
-export type RequestLogListResponse = {
-  items: RequestLogItem[];
+export interface RequestLogListResponse {
+  items: RequestLogEntry[];
+  total: number;
   limit: number;
-  has_more: boolean;
-  next_cursor?: string;
-};
+  offset: number;
+}
 
-export type RequestLogListFilters = {
-  from?: string;
-  to?: string;
-  platform_name?: string;
-  account?: string;
-  target_host?: string;
-  egress_ip?: string;
-  proxy_type?: number;
-  net_ok?: boolean;
-  http_status?: number;
-  limit: number;
-  cursor?: string;
-  fuzzy?: boolean;
-};
+export interface RequestLogFilters {
+  platform: string;
+  account: string;
+  egressError: string;
+}
 
-export type RequestLogPayloads = {
-  req_headers_b64: string;
-  req_body_b64: string;
-  resp_headers_b64: string;
-  resp_body_b64: string;
-  truncated: {
-    req_headers: boolean;
-    req_body: boolean;
-    resp_headers: boolean;
-    resp_body: boolean;
-  };
+export const EMPTY_REQUEST_LOG_FILTERS: RequestLogFilters = {
+  platform: "",
+  account: "",
+  egressError: "",
 };

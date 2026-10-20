@@ -54,6 +54,12 @@ const handshakeTimeout = 15 * time.Second
 // Server is the SOCKS5 ingress.
 type Server struct {
 	p *pipeline.Pipeline
+
+	// RequireAuthInfo applies only in no-auth mode (empty proxy token):
+	// when set, the server negotiates ONLY RFC1929 userpass and demands a
+	// non-empty username (identity) and password; the password content is
+	// not validated. With a configured token it changes nothing.
+	RequireAuthInfo bool
 }
 
 // New builds a SOCKS5 Server around the pipeline.
@@ -96,13 +102,14 @@ func (s *Server) serveConn(conn net.Conn) {
 	}
 	_ = conn.SetDeadline(time.Time{}) // handshake done; relay is conn-driven
 
-	prep, perr := s.p.Prepare(ctx, pipeline.Request{
+	req := pipeline.Request{
 		Token:       password,
 		RawIdentity: rawIdentity,
 		Target:      target,
 		Proto:       pipeline.ProtoSOCKS5,
 		RemoteAddr:  conn.RemoteAddr().String(),
-	})
+	}
+	prep, perr := s.p.Prepare(ctx, req)
 	if perr != nil {
 		// Route/dial failures surface as REP 0x01 (spec/errors.md §2);
 		// a vanished client gets silence.
@@ -115,7 +122,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		_ = prep.Upstream.Close()
 		return
 	}
-	_ = s.p.Relay(ctx, prep, &readWrapConn{Conn: conn, r: io.MultiReader(br, conn)})
+	_ = s.p.Relay(ctx, prep, &readWrapConn{Conn: conn, r: io.MultiReader(br, conn)}, req)
 }
 
 // handshake performs greeting + method negotiation + optional RFC1929
@@ -144,6 +151,13 @@ func (s *Server) handshake(conn net.Conn, br *bufio.Reader) (rawIdentity, passwo
 	switch {
 	case token != "":
 		// Auth required: only userpass is acceptable.
+		if hasUserPass {
+			selected = socks5MethodUserPass
+		} else {
+			selected = socks5MethodNoAcceptable // → AUTH_REQUIRED
+		}
+	case s.RequireAuthInfo:
+		// No-auth mode with forced auth info: only userpass is acceptable.
 		if hasUserPass {
 			selected = socks5MethodUserPass
 		} else {
@@ -196,6 +210,9 @@ func (s *Server) authenticateUserPass(conn net.Conn, br *bufio.Reader, token str
 	}
 	if token != "" && subtle.ConstantTimeCompare(password, []byte(token)) != 1 {
 		return fail() // → AUTH_FAILED
+	}
+	if token == "" && s.RequireAuthInfo && (len(username) == 0 || len(password) == 0) {
+		return fail() // forced auth info must be non-empty (content unchecked)
 	}
 	if _, err := conn.Write([]byte{socks5UserPassVersion, socks5UserPassOK}); err != nil {
 		return "", "", false

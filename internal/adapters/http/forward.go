@@ -1,178 +1,181 @@
-// Package forward implements the HTTP forward-proxy ingress adapter:
-// one raw TCP listener, CONNECT tunneling plus plain absolute-URI
+// Package forward implements the HTTP forward-proxy ingress adapter as a
+// standard http.Handler: CONNECT tunneling plus plain absolute-URI
 // forwarding, both routed through the pipeline (design §4.1).
 //
-// Wire behavior mirrors the reference forward proxy (spec/identity.md,
-// spec/errors.md): Proxy-Authorization: Basic base64("Platform.Account:TOKEN"),
+// Wire behavior (spec/identity.md, spec/errors.md):
+// Proxy-Authorization: Basic base64("Platform.Account:TOKEN"),
 // 407 + Proxy-Authenticate on missing/malformed credentials, then the
 // pipeline's ProxyError → HTTP status mapping.
+//
+// Mounting note: http.Server parses CONNECT and absolute-URI requests
+// for us; the upstream connection is dialed before hijack so dial errors
+// stay mappable to HTTP error responses (same contract as reverse).
 package forward
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/textproto"
-	"net/url"
 	"strings"
-	"time"
 
 	"github.com/xiarsx/egress/internal/app/pipeline"
 )
 
-// maxHeadBytes caps the request line + headers the adapter buffers.
-const maxHeadBytes = 1 << 20
-
-// handshakeReadTimeout bounds the initial request-head read (slowloris guard).
-const handshakeReadTimeout = 30 * time.Second
-
-// Server is the HTTP forward-proxy ingress.
+// Server is the HTTP forward-proxy ingress handler.
 type Server struct {
 	p *pipeline.Pipeline
+
+	// RequireAuthInfo applies only in no-auth mode (empty proxy token):
+	// when set, requests without Proxy-Authorization get 407 (the header
+	// carries identity; the password is not validated). With a configured
+	// token it changes nothing.
+	RequireAuthInfo bool
 }
 
 // New builds a forward-proxy Server around the pipeline.
 func New(p *pipeline.Pipeline) *Server { return &Server{p: p} }
 
-// Serve accepts connections until the listener is closed.
-func (s *Server) Serve(l net.Listener) error {
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				continue
-			}
-			return err
-		}
-		go s.serveConn(c)
-	}
-}
-
-func (s *Server) serveConn(conn net.Conn) {
-	defer conn.Close()
-	ctx := context.Background()
-	remote := conn.RemoteAddr().String()
-
-	_ = conn.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
-	br := bufio.NewReaderSize(conn, 64*1024)
-	head, method, target, hdr, err := readRequestHead(br)
-	_ = conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		return // malformed head: nothing sane to answer with
-	}
-	headers := lowerHeaders(hdr)
-
-	rawIdentity, token, authOK := s.credentials(headers)
-	if !authOK {
-		writeProxyError(conn, &pipeline.ProxyError{Code: pipeline.CodeAuthRequired, Msg: "proxy authentication required"})
+// ServeHTTP implements http.Handler: CONNECT → tunnel; anything else is
+// a plain forward request (absolute-URI, or origin-form + Host header).
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	headers := lowerHeaders(r.Header)
+	rawIdentity, token, perr := s.credentials(headers)
+	if perr != nil {
+		pipeline.WriteHTTPError(w, perr)
 		return
 	}
-
-	if method == "CONNECT" {
-		s.serveConnect(ctx, conn, remote, headers, rawIdentity, token, target)
+	if r.Method == http.MethodConnect {
+		s.serveConnect(w, r, headers, rawIdentity, token)
 		return
 	}
-	s.servePlain(ctx, conn, br, remote, headers, rawIdentity, token, head, target)
+	s.servePlain(w, r, headers, rawIdentity, token)
 }
 
 // credentials extracts (identity, token) from Proxy-Authorization.
-// ok=false means the header was present but malformed and auth is
-// required → the caller answers 407. A missing header yields empty
-// values and lets the pipeline decide (407 when a token is configured).
-func (s *Server) credentials(headers map[string]string) (rawIdentity, token string, ok bool) {
+// A missing header yields empty values and lets the pipeline decide
+// (407 when a token is configured) — except RequireAuthInfo mode, which
+// rejects it here. A malformed header is 407 when a token is configured
+// and ignored otherwise.
+func (s *Server) credentials(headers map[string]string) (rawIdentity, token string, perr *pipeline.ProxyError) {
 	auth := headers["proxy-authorization"]
 	if auth == "" {
-		return "", "", true
+		if s.p.ProxyToken() == "" && s.RequireAuthInfo {
+			return "", "", &pipeline.ProxyError{Code: pipeline.CodeAuthRequired, Msg: "proxy authentication required"}
+		}
+		return "", "", nil
 	}
 	cred, good := parseBasicCredential(auth)
 	if !good {
 		if s.p.ProxyToken() != "" {
-			return "", "", false
+			return "", "", &pipeline.ProxyError{Code: pipeline.CodeAuthRequired, Msg: "malformed Proxy-Authorization"}
 		}
-		return "", "", true // auth disabled: ignore the garbage header
+		return "", "", nil // auth disabled: ignore the garbage header
 	}
-	return splitCredential(cred)
+	rawIdentity, token, _ = splitCredential(cred)
+	return rawIdentity, token, nil
 }
 
 // serveConnect handles CONNECT host:port: dial first (so dial errors stay
 // mappable to 502/504 per spec/errors.md), then 200, then relay.
-func (s *Server) serveConnect(ctx context.Context, conn net.Conn, remote string,
-	headers map[string]string, rawIdentity, token, target string) {
+func (s *Server) serveConnect(w http.ResponseWriter, r *http.Request,
+	headers map[string]string, rawIdentity, token string) {
+	target := r.Host
 	if _, _, err := net.SplitHostPort(target); err != nil {
-		writeProxyError(conn, &pipeline.ProxyError{Code: pipeline.CodeInvalidHost, Msg: "CONNECT target must be host:port"})
+		pipeline.WriteHTTPError(w, &pipeline.ProxyError{Code: pipeline.CodeInvalidHost, Msg: "CONNECT target must be host:port"})
 		return
 	}
-	prep, perr := s.p.Prepare(ctx, pipeline.Request{
+	req := pipeline.Request{
 		Token:       token,
 		RawIdentity: rawIdentity,
 		Target:      target,
 		Headers:     headers,
 		Proto:       pipeline.ProtoHTTPForward,
-		RemoteAddr:  remote,
-	})
+		RemoteAddr:  r.RemoteAddr,
+	}
+	prep, perr := s.p.Prepare(r.Context(), req)
 	if perr != nil {
-		writeProxyError(conn, perr)
+		pipeline.WriteHTTPError(w, perr)
 		return
 	}
+	conn, rw, err := hijack(w)
+	if err != nil {
+		_ = prep.Upstream.Close()
+		pipeline.WriteHTTPError(w, &pipeline.ProxyError{Code: pipeline.CodeInternalError, Msg: "hijack unsupported"})
+		return
+	}
+	defer conn.Close()
 	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		_ = prep.Upstream.Close()
 		return
 	}
-	_ = s.p.Relay(ctx, prep, readWrapped(conn))
+	_ = s.p.Relay(r.Context(), prep, &readWrapConn{Conn: conn, r: io.MultiReader(rw.Reader, conn)}, req)
 }
 
-// servePlain handles a plain (non-CONNECT) request: the already-read head
-// bytes go upstream first, then the raw relay streams the response back.
-func (s *Server) servePlain(ctx context.Context, conn net.Conn, br *bufio.Reader, remote string,
-	headers map[string]string, rawIdentity, token string, head []byte, target string) {
-	scheme, hostport, perr := parseForwardTarget(target, headers)
+// servePlain handles a plain (non-CONNECT) request: the re-serialized
+// head goes upstream first, then the raw relay streams the response back.
+func (s *Server) servePlain(w http.ResponseWriter, r *http.Request,
+	headers map[string]string, rawIdentity, token string) {
+	scheme, hostport, perr := forwardTarget(r, headers)
 	if perr != nil {
-		writeProxyError(conn, perr)
+		pipeline.WriteHTTPError(w, perr)
 		return
 	}
-	// Preserve bytes the client pipelined behind the head.
-	client := readWrappedConn(conn, br)
-	if perr := s.p.Handle(ctx, client, pipeline.Request{
+	req := pipeline.Request{
 		Token:       token,
 		RawIdentity: rawIdentity,
 		Target:      hostport,
 		Headers:     headers,
 		Proto:       pipeline.ProtoHTTPForward,
-		RemoteAddr:  remote,
-		Head:        head,
+		RemoteAddr:  r.RemoteAddr,
+		Head:        buildHead(r, scheme),
 		Scheme:      scheme,
-	}); perr != nil {
-		writeProxyError(conn, perr)
 	}
+	prep, perr := s.p.Prepare(r.Context(), req)
+	if perr != nil {
+		pipeline.WriteHTTPError(w, perr)
+		return
+	}
+	// Write the head BEFORE hijack: a dead upstream is still mappable to
+	// 502 UPSTREAM_REQUEST_FAILED here (spec/vectors/error_scenarios.yaml).
+	if _, perr := s.p.WriteHead(r.Context(), prep, req); perr != nil {
+		_ = prep.Upstream.Close()
+		pipeline.WriteHTTPError(w, perr)
+		return
+	}
+	conn, rw, err := hijack(w)
+	if err != nil {
+		_ = prep.Upstream.Close()
+		pipeline.WriteHTTPError(w, &pipeline.ProxyError{Code: pipeline.CodeInternalError, Msg: "hijack unsupported"})
+		return
+	}
+	defer conn.Close()
+	// Replay bytes the server may have buffered (request body) before the
+	// live connection.
+	_ = s.p.Relay(r.Context(), prep, &readWrapConn{Conn: conn, r: io.MultiReader(rw.Reader, conn)}, req)
 }
 
-// parseForwardTarget resolves the upstream host:port and scheme for a
-// plain forward request.
-func parseForwardTarget(target string, headers map[string]string) (scheme, hostport string, perr *pipeline.ProxyError) {
-	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-		u, err := url.Parse(target)
-		if err != nil || u.Hostname() == "" {
+// forwardTarget resolves the upstream scheme and host:port of a plain
+// forward request.
+func forwardTarget(r *http.Request, headers map[string]string) (scheme, hostport string, perr *pipeline.ProxyError) {
+	if r.URL.IsAbs() {
+		scheme = strings.ToLower(r.URL.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return "", "", &pipeline.ProxyError{Code: pipeline.CodeInvalidProtocol, Msg: "scheme must be http or https"}
+		}
+		if r.URL.Hostname() == "" {
 			return "", "", &pipeline.ProxyError{Code: pipeline.CodeInvalidHost, Msg: "invalid absolute URI"}
 		}
-		scheme = strings.ToLower(u.Scheme)
-		port := u.Port()
+		port := r.URL.Port()
 		if port == "" {
 			port = "80"
 			if scheme == "https" {
 				port = "443"
 			}
 		}
-		return scheme, net.JoinHostPort(u.Hostname(), port), nil
+		return scheme, net.JoinHostPort(r.URL.Hostname(), port), nil
 	}
 	// Origin-form: fall back to the Host header (transparent-proxy style).
 	host := headers["host"]
@@ -185,49 +188,57 @@ func parseForwardTarget(target string, headers map[string]string) (scheme, hostp
 	return "http", host, nil
 }
 
-// readRequestHead reads the request line + headers, returning the raw
-// head bytes (forwarded verbatim upstream for plain requests), the parsed
-// method/target, and the header map.
-func readRequestHead(br *bufio.Reader) (head []byte, method, target string, hdr http.Header, err error) {
-	var buf bytes.Buffer
-	line, err := readLineCapped(br, &buf)
-	if err != nil {
-		return nil, "", "", nil, err
-	}
-	parts := strings.SplitN(strings.TrimRight(string(line), "\r\n"), " ", 3)
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
-		return nil, "", "", nil, errors.New("bad request line")
-	}
-	// Header lines, raw.
-	for {
-		l, err := readLineCapped(br, &buf)
-		if err != nil {
-			return nil, "", "", nil, err
-		}
-		if len(bytes.TrimRight(l, "\r\n")) == 0 {
-			break
-		}
-	}
-	raw := buf.Bytes()
-	// Parse headers from the raw bytes (positions: first line + \n).
-	headEnd := bytes.IndexByte(raw, '\n') + 1
-	mime, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw[headEnd:]))).ReadMIMEHeader()
-	if err != nil {
-		return nil, "", "", nil, err
-	}
-	return raw, parts[0], parts[1], http.Header(mime), nil
+// strippedForwardHeaders never travels upstream: proxy-chain credentials,
+// hop-by-hop framing and identity-disclosing headers.
+var strippedForwardHeaders = []string{
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"X-Egress-Account",
+	"Forwarded",
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"Via",
+	"X-Real-IP",
 }
 
-func readLineCapped(br *bufio.Reader, buf *bytes.Buffer) ([]byte, error) {
-	line, err := br.ReadBytes('\n')
-	buf.Write(line)
-	if buf.Len() > maxHeadBytes {
-		return nil, errors.New("request head too large")
+func strippedHeader(name string) bool {
+	for _, s := range strippedForwardHeaders {
+		if strings.EqualFold(s, name) {
+			return true
+		}
 	}
-	if err != nil {
-		return nil, err
+	return false
+}
+
+// buildHead re-serializes the request for upstream: origin-form path,
+// end-to-end headers, framing headers. The body streams through the
+// relay untouched.
+func buildHead(r *http.Request, scheme string) []byte {
+	path := r.URL.RequestURI() // origin-form path?query (never the absolute URI)
+	if path == "" {
+		path = "/"
 	}
-	return line, nil
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s %s HTTP/1.1\r\n", r.Method, path)
+	sb.WriteString("Host: " + r.Host + "\r\n")
+	for name, vv := range r.Header {
+		if strippedHeader(name) {
+			continue
+		}
+		for _, v := range vv {
+			fmt.Fprintf(&sb, "%s: %s\r\n", name, v)
+		}
+	}
+	// Framing: net/http strips these from r.Header.
+	if r.ContentLength > 0 {
+		fmt.Fprintf(&sb, "Content-Length: %d\r\n", r.ContentLength)
+	}
+	for _, enc := range r.TransferEncoding {
+		fmt.Fprintf(&sb, "Transfer-Encoding: %s\r\n", enc)
+	}
+	sb.WriteString("\r\n")
+	return []byte(sb.String())
 }
 
 func lowerHeaders(hdr http.Header) map[string]string {
@@ -241,7 +252,7 @@ func lowerHeaders(hdr http.Header) map[string]string {
 }
 
 // parseBasicCredential decodes "Basic base64(...)" (scheme
-// case-insensitive, mirroring the reference).
+// case-insensitive).
 func parseBasicCredential(auth string) (string, bool) {
 	parts := strings.Fields(auth)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Basic") {
@@ -263,40 +274,19 @@ func splitCredential(cred string) (rawIdentity, token string, ok bool) {
 	return cred, "", true
 }
 
-// readWrappedConn replays bytes already buffered in br before reading
-// from the live connection.
-func readWrappedConn(conn net.Conn, br *bufio.Reader) net.Conn {
-	return &readWrapConn{Conn: conn, r: io.MultiReader(br, conn)}
+// hijack takes over the client connection.
+func hijack(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("hijack unsupported")
+	}
+	return hj.Hijack()
 }
 
+// readWrapConn replays hijack-buffered bytes before the live conn.
 type readWrapConn struct {
 	net.Conn
 	r io.Reader
 }
 
 func (w *readWrapConn) Read(b []byte) (int, error) { return w.r.Read(b) }
-
-func readWrapped(conn net.Conn) net.Conn { return &readWrapConn{Conn: conn, r: conn} }
-
-// writeProxyError writes the spec/errors.md §1 HTTP error response.
-// CodeClientCanceled is silent: the client is already gone.
-func writeProxyError(conn net.Conn, perr *pipeline.ProxyError) {
-	if perr == nil || perr.Code == pipeline.CodeClientCanceled {
-		return
-	}
-	status := pipeline.HTTPStatus(perr.Code)
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status))
-	if perr.Code == pipeline.CodeAuthRequired {
-		sb.WriteString("Proxy-Authenticate: Basic realm=\"Resin\"\r\n")
-	}
-	fmt.Fprintf(&sb, "X-Resin-Error: %s\r\n", perr.Code)
-	sb.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	body := perr.Msg
-	if body == "" {
-		body = perr.Code
-	}
-	fmt.Fprintf(&sb, "Content-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
-	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, _ = io.WriteString(conn, sb.String())
-}

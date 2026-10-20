@@ -5,9 +5,8 @@
 // optional declarative config file path. Everything else is a declarative
 // resource (see internal/app/control) and can be changed at runtime.
 //
-// Environment naming: EGRESS_* is canonical. A missing EGRESS_* falls back
-// to the legacy RESIN_* name for one major version and prints a deprecation
-// warning to stderr (design §17).
+// Environment naming: EGRESS_* is the only prefix; no legacy aliases are
+// honored.
 package config
 
 import (
@@ -15,20 +14,18 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
+	"time"
 
 	"github.com/xiarsx/egress/internal/core/identity"
 )
 
-// Defaults for the startup environment. They mirror the reference
-// implementation's RESIN_* defaults (docs/refmap.md §2.9); only the
-// variable prefix was renamed.
+// Defaults for the startup environment.
 const (
 	DefaultListenAddress = "0.0.0.0"
 	DefaultPort          = "2260"
-	DefaultStateDir      = "/var/lib/resin"
-	DefaultCacheDir      = "/var/cache/resin"
-	DefaultLogDir        = "/var/log/resin"
+	DefaultStateDir      = "/var/lib/egress"
+	DefaultCacheDir      = "/var/cache/egress"
+	DefaultLogDir        = "/var/log/egress"
 )
 
 // Config is the startup configuration, loaded once from the environment.
@@ -52,15 +49,22 @@ type Config struct {
 	// ConfigFile is the optional declarative YAML file (EGRESS_CONFIG).
 	// Empty means "no file".
 	ConfigFile string
+
+	// --- ops/test knobs (optional; zero values select built-in defaults) ---
+
+	// GeoIPDB is the MaxMind .mmdb path; empty = GeoIP enrichment off.
+	GeoIPDB string
+	// EgressTraceURL overrides the egress-probe trace endpoint.
+	EgressTraceURL string
+	// CacheFlushInterval narrows the cache.db crash-consistency window
+	// (default runtime.CacheFlushInterval).
+	CacheFlushInterval time.Duration
+	// ReqLogFlushInterval narrows the request-log batch flush window
+	// (default 5s).
+	ReqLogFlushInterval time.Duration
 }
 
 // Load reads the configuration from the environment.
-//
-// Resolution order per variable: EGRESS_* first; when unset (or empty,
-// except for the two tokens where an explicit empty value is meaningful),
-// fall back to RESIN_* and print a deprecation warning to stderr:
-//
-//	[DEPRECATED] 环境变量 RESIN_X 已更名为 EGRESS_X，请迁移
 //
 // Load returns an error when a required variable is missing or invalid:
 //   - EGRESS_ADMIN_TOKEN must be set and non-empty.
@@ -70,8 +74,8 @@ func Load() (Config, error) {
 	var c Config
 	var err error
 
-	addr := envOrLegacy("EGRESS_LISTEN_ADDRESS", DefaultListenAddress)
-	port := envOrLegacy("EGRESS_PORT", DefaultPort)
+	addr := envOr("EGRESS_LISTEN_ADDRESS", DefaultListenAddress)
+	port := envOr("EGRESS_PORT", DefaultPort)
 	if err := validatePort(port); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
@@ -87,36 +91,43 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: invalid proxy token: %w", err)
 	}
 
-	c.StateDir = envOrLegacy("EGRESS_STATE_DIR", DefaultStateDir)
-	c.CacheDir = envOrLegacy("EGRESS_CACHE_DIR", DefaultCacheDir)
-	c.LogDir = envOrLegacy("EGRESS_LOG_DIR", DefaultLogDir)
-	c.ConfigFile = envOrLegacy("EGRESS_CONFIG", "")
+	c.StateDir = envOr("EGRESS_STATE_DIR", DefaultStateDir)
+	c.CacheDir = envOr("EGRESS_CACHE_DIR", DefaultCacheDir)
+	c.LogDir = envOr("EGRESS_LOG_DIR", DefaultLogDir)
+	c.ConfigFile = envOr("EGRESS_CONFIG", "")
+
+	// Optional ops/test knobs. Durations fail fast on garbage — a typo'd
+	// interval silently falling back to the default is worse than no boot.
+	c.GeoIPDB = envOr("EGRESS_GEOIP_DB", "")
+	c.EgressTraceURL = envOr("EGRESS_EGRESS_TRACE_URL", "")
+	if c.CacheFlushInterval, err = envDuration("EGRESS_CACHE_FLUSH_INTERVAL"); err != nil {
+		return Config{}, err
+	}
+	if c.ReqLogFlushInterval, err = envDuration("EGRESS_REQLOG_FLUSH_INTERVAL"); err != nil {
+		return Config{}, err
+	}
 
 	return c, nil
 }
 
-// legacyName maps EGRESS_X to RESIN_X.
-func legacyName(egress string) string {
-	return "RESIN_" + strings.TrimPrefix(egress, "EGRESS_")
-}
-
-// lookup returns the value and whether the variable is set to a non-empty
-// value. An explicitly empty value counts as unset here; callers that need
-// to distinguish (the two tokens) use lookupRaw instead.
-func lookup(name string) (string, bool) {
-	v, ok := os.LookupEnv(name)
-	return v, ok && v != ""
-}
-
-// envOrLegacy resolves EGRESS_* with fallback to RESIN_*.
-// A used legacy variable prints the deprecation warning.
-func envOrLegacy(egress, def string) string {
-	if v, ok := lookup(egress); ok {
-		return v
+// envDuration parses an optional duration variable; empty/unset → 0.
+func envDuration(name string) (time.Duration, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0, nil
 	}
-	legacy := legacyName(egress)
-	if v, ok := lookup(legacy); ok {
-		deprecated(legacy, egress)
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: invalid %s %q: %w", name, v, err)
+	}
+	return d, nil
+}
+
+// envOr returns the variable's value when set and non-empty, else def.
+// An explicitly empty value counts as unset here; callers that need to
+// distinguish (the two tokens) use requiredToken instead.
+func envOr(name, def string) string {
+	if v, ok := os.LookupEnv(name); ok && v != "" {
 		return v
 	}
 	return def
@@ -125,27 +136,14 @@ func envOrLegacy(egress, def string) string {
 // requiredToken resolves a token variable. When allowEmpty is false the
 // value must be non-empty; when true an explicitly empty value is accepted
 // (no-auth mode) but the variable itself must still be present.
-func requiredToken(egress string, allowEmpty bool) (string, error) {
-	legacy := legacyName(egress)
-	if v, ok := os.LookupEnv(egress); ok {
+func requiredToken(name string, allowEmpty bool) (string, error) {
+	if v, ok := os.LookupEnv(name); ok {
 		if v == "" && !allowEmpty {
-			return "", fmt.Errorf("config: 环境变量 %s 不得为空", egress)
+			return "", fmt.Errorf("config: 环境变量 %s 不得为空", name)
 		}
 		return v, nil
 	}
-	if v, ok := os.LookupEnv(legacy); ok {
-		deprecated(legacy, egress)
-		if v == "" && !allowEmpty {
-			return "", fmt.Errorf("config: 环境变量 %s（已更名为 %s）不得为空", legacy, egress)
-		}
-		return v, nil
-	}
-	return "", fmt.Errorf("config: 缺少必填环境变量 %s（兼容变量 %s）", egress, legacy)
-}
-
-// deprecated prints the standard rename warning to stderr.
-func deprecated(oldName, newName string) {
-	fmt.Fprintf(os.Stderr, "[DEPRECATED] 环境变量 %s 已更名为 %s，请迁移\n", oldName, newName)
+	return "", fmt.Errorf("config: 缺少必填环境变量 %s", name)
 }
 
 func validatePort(port string) error {

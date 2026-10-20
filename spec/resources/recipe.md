@@ -15,7 +15,7 @@ metadata:
 spec:
   identityPolicy:                       # 展开为 IdentityPolicy 资源
     chain:
-      - header: X-Resin-Account
+      - header: X-Egress-Account
       - wire: {}
       - headerRule: { rules: [ { prefix: "api.example.com", headers: [Authorization] } ] }
     onMiss: random

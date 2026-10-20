@@ -46,13 +46,13 @@ type parsedPath struct {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	parsed, perr := h.parsePath(r.URL.EscapedPath())
 	if perr != nil {
-		writeHTTPError(w, perr)
+		pipeline.WriteHTTPError(w, perr)
 		return
 	}
 
 	headers := lowerHeaders(r.Header)
 	head := buildHead(r, parsed)
-	prep, perr := h.p.Prepare(r.Context(), pipeline.Request{
+	req := pipeline.Request{
 		Token:       parsed.token,
 		RawIdentity: parsed.identity,
 		Target:      parsed.hostPort(),
@@ -61,16 +61,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RemoteAddr:  r.RemoteAddr,
 		Head:        head,
 		Scheme:      parsed.protocol,
-	})
+	}
+	prep, perr := h.p.Prepare(r.Context(), req)
 	if perr != nil {
-		writeHTTPError(w, perr)
+		pipeline.WriteHTTPError(w, perr)
+		return
+	}
+	// Write the head BEFORE hijack so a dead upstream stays mappable to
+	// 502 UPSTREAM_REQUEST_FAILED (spec/vectors/error_scenarios.yaml).
+	if _, perr := h.p.WriteHead(r.Context(), prep, req); perr != nil {
+		_ = prep.Upstream.Close()
+		pipeline.WriteHTTPError(w, perr)
 		return
 	}
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		_ = prep.Upstream.Close()
-		writeHTTPError(w, &pipeline.ProxyError{Code: pipeline.CodeInternalError, Msg: "hijack unsupported"})
+		pipeline.WriteHTTPError(w, &pipeline.ProxyError{Code: pipeline.CodeInternalError, Msg: "hijack unsupported"})
 		return
 	}
 	conn, rw, err := hj.Hijack()
@@ -82,7 +90,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Replay bytes the server may have buffered (request body) before the
 	// live connection.
 	client := &readWrapConn{Conn: conn, r: io.MultiReader(rw.Reader, conn)}
-	_ = h.p.Relay(r.Context(), prep, client)
+	_ = h.p.Relay(r.Context(), prep, client, req)
 }
 
 // parsePath parses the V1 reverse path. rawPath must be r.URL.EscapedPath().
@@ -166,7 +174,7 @@ func isValidHost(host string) bool {
 // forwardingIdentityHeaders are stripped from the upstream request
 // (reference list): they would disclose proxy-chain identity.
 var forwardingIdentityHeaders = []string{
-	"X-Resin-Account",
+	"X-Egress-Account",
 	"Forwarded",
 	"X-Forwarded-For",
 	"X-Forwarded-Host",
@@ -228,27 +236,6 @@ func lowerHeaders(hdr http.Header) map[string]string {
 		}
 	}
 	return m
-}
-
-// writeHTTPError writes the spec/errors.md §1 HTTP error response.
-// CodeClientCanceled is silent: the client is already gone.
-func writeHTTPError(w http.ResponseWriter, perr *pipeline.ProxyError) {
-	if perr == nil || perr.Code == pipeline.CodeClientCanceled {
-		return
-	}
-	status := pipeline.HTTPStatus(perr.Code)
-	h := w.Header()
-	h.Set("X-Resin-Error", perr.Code)
-	h.Set("Content-Type", "text/plain; charset=utf-8")
-	if perr.Code == pipeline.CodeAuthRequired {
-		h.Set("Proxy-Authenticate", `Basic realm="Resin"`)
-	}
-	msg := perr.Msg
-	if msg == "" {
-		msg = perr.Code
-	}
-	w.WriteHeader(status)
-	_, _ = io.WriteString(w, msg)
 }
 
 // readWrapConn replays hijack-buffered bytes before the live conn.

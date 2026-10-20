@@ -281,7 +281,7 @@ export function NodesPage() {
 
   const queryClient = useQueryClient();
 
-  const allRegions = useMemo(() => getAllRegions(), [locale]);
+  const allRegions = useMemo(() => getAllRegions(locale), [locale]);
 
   const platformsQuery = useQuery({
     queryKey: ["platforms", "all"],

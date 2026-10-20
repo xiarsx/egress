@@ -42,6 +42,21 @@ func (NopHooks) OnPlatformDeleted(string) {}
 func (NopHooks) OnSourceChanged(string)   {}
 func (NopHooks) OnSourceDeleted(string)   {}
 
+// EndpointHooks notifies the ingress layer of endpoint changes
+// (spec/resources/endpoint.md). Wired by the assembly root to the
+// endpoint.Manager; separate from ports.RuntimeHooks because endpoints
+// are ingress, not runtime.
+type EndpointHooks interface {
+	OnEndpointChanged(name string)
+	OnEndpointDeleted(name string)
+}
+
+// EndpointStatus reports one endpoint's runtime state.
+type EndpointStatus struct {
+	Listening bool
+	LastError string
+}
+
 // Service is the control-plane use-case layer: resource CRUD over
 // ports.Store plus the PlatformSource/SourceSource adapters the runtime
 // consumes. It never touches runtime state directly; change notifications
@@ -50,8 +65,17 @@ type Service struct {
 	store ports.Store
 	hooks ports.RuntimeHooks
 
+	endpointHooks  EndpointHooks
+	endpointStatus func(name string) (EndpointStatus, bool)
+
 	adminToken      string
-	backend         RuntimeBackend
+	nodeBackend     NodeBackend
+	leaseBackend    LeaseBackend
+	viewBackend     ViewBackend
+	sourceBackend   SourceBackend
+	metricsBackend  MetricsBackend
+	reqLogBackend   ReqLogBackend
+	geoBackend      GeoBackend
 	version         string
 	startTime       time.Time
 	bootConfig      SystemConfig
@@ -74,7 +98,10 @@ func WithAdminToken(t string) Option {
 // metrics, request logs, geoip, probes). While absent those routes answer
 // 501 NOT_IMPLEMENTED.
 func WithRuntimeBackend(b RuntimeBackend) Option {
-	return func(s *Service) { s.backend = b }
+	return func(s *Service) {
+		s.nodeBackend, s.leaseBackend, s.viewBackend = b, b, b
+		s.sourceBackend, s.metricsBackend, s.reqLogBackend, s.geoBackend = b, b, b, b
+	}
 }
 
 // WithVersion sets the version reported by GET /api/v1/system/info.
@@ -92,6 +119,12 @@ func WithSystemConfig(c SystemConfig) Option {
 // WithAPIMaxBodyBytes caps request body sizes on the API (default 8MiB).
 func WithAPIMaxBodyBytes(n int64) Option {
 	return func(s *Service) { s.apiMaxBodyBytes = n }
+}
+
+// WithEndpointHooks wires the ingress-layer endpoint change notifications
+// and the status probe used to decorate endpoint reads.
+func WithEndpointHooks(h EndpointHooks, status func(name string) (EndpointStatus, bool)) Option {
+	return func(s *Service) { s.endpointHooks, s.endpointStatus = h, status }
 }
 
 // NewService builds a control-plane Service. hooks may be nil (treated as
@@ -657,8 +690,19 @@ func (s *Service) DeleteSource(ctx context.Context, name string) error {
 // ApplyEndpoint creates or updates an endpoint by name.
 func (s *Service) ApplyEndpoint(ctx context.Context, e Endpoint) error {
 	e.Name = cleanName(e.Name)
-	// Creation defaults per spec/resources/endpoint.md.
-	e.Enabled = true
+	// Creation default per spec/resources/endpoint.md; an update keeps the
+	// stored enabled state unless the caller sets it explicitly (PATCH).
+	if _, err := s.store.Get(ctx, ports.KindEndpoint, e.Name); errors.Is(err, ports.ErrNotFound) {
+		e.Enabled = true
+	} else if err != nil {
+		return err
+	} else {
+		cur, gerr := s.GetEndpoint(ctx, e.Name)
+		if gerr != nil {
+			return gerr
+		}
+		e.Enabled = cur.Enabled
+	}
 	if err := e.Validate(); err != nil {
 		return asInvalid(err)
 	}
@@ -667,11 +711,19 @@ func (s *Service) ApplyEndpoint(ctx context.Context, e Endpoint) error {
 	spec.CreatedAtNs, spec.UpdatedAtNs = 0, 0
 	_, err := s.upsertResource(ctx, ports.KindEndpoint, e.Name, e.Name, spec,
 		map[string]string{AnnotationDrifted: "true"})
-	return err
+	if err != nil {
+		return err
+	}
+	s.notifyEndpointChanged(e.Name)
+	return nil
 }
 
-// GetEndpoint returns an endpoint by name.
+// GetEndpoint returns an endpoint by name. The env-defined default
+// endpoint is synthesized on the fly (never stored, read-only).
 func (s *Service) GetEndpoint(ctx context.Context, name string) (Endpoint, error) {
+	if cleanName(name) == DefaultEndpointName {
+		return s.defaultEndpoint(), nil
+	}
 	var e Endpoint
 	doc, err := s.getSpec(ctx, ports.KindEndpoint, name, &e)
 	if err != nil {
@@ -681,16 +733,21 @@ func (s *Service) GetEndpoint(ctx context.Context, name string) (Endpoint, error
 	e.Name = doc.Metadata.Name
 	e.CreatedAtNs = doc.Metadata.CreatedAtNs
 	e.UpdatedAtNs = doc.Metadata.UpdatedAtNs
+	s.decorateEndpoint(&e)
 	return e, nil
 }
 
-// ListEndpoints returns a page of endpoints ordered by name.
+// ListEndpoints returns a page of endpoints ordered by name. The
+// synthesized default endpoint sorts first on the first page.
 func (s *Service) ListEndpoints(ctx context.Context, limit, offset int) ([]Endpoint, int, error) {
 	page, err := s.store.List(ctx, ports.KindEndpoint, ports.ListOptions{Limit: limit, Offset: offset})
 	if err != nil {
 		return nil, 0, err
 	}
-	out := make([]Endpoint, 0, len(page.Items))
+	out := make([]Endpoint, 0, len(page.Items)+1)
+	if offset == 0 {
+		out = append(out, s.defaultEndpoint())
+	}
 	for _, r := range page.Items {
 		var e Endpoint
 		doc, derr := decodeDoc(r.Data, &e)
@@ -701,9 +758,56 @@ func (s *Service) ListEndpoints(ctx context.Context, limit, offset int) ([]Endpo
 		e.Name = doc.Metadata.Name
 		e.CreatedAtNs = doc.Metadata.CreatedAtNs
 		e.UpdatedAtNs = doc.Metadata.UpdatedAtNs
+		s.decorateEndpoint(&e)
 		out = append(out, e)
 	}
-	return out, page.Total, nil
+	return out, page.Total + 1, nil
+}
+
+// defaultEndpoint synthesizes the env-defined default endpoint
+// (spec/resources/endpoint.md: 环境变量定义的默认入口在运行时合成，永不存入资源).
+func (s *Service) defaultEndpoint() Endpoint {
+	e := Endpoint{
+		ID:                   DefaultEndpointName,
+		Name:                 DefaultEndpointName,
+		Port:                 s.bootConfig.Port,
+		Enabled:              true,
+		AllowManagement:      true,
+		AllowProxy:           true,
+		RequireProxyAuthInfo: false,
+		AllowHTTPForward:     true,
+		AllowHTTPReverse:     true,
+		AllowSOCKS5:          true,
+		ReadOnly:             true,
+	}
+	s.decorateEndpoint(&e)
+	return e
+}
+
+// decorateEndpoint fills the runtime fields (listening, last_error) via
+// the wired status probe.
+func (s *Service) decorateEndpoint(e *Endpoint) {
+	if s.endpointStatus == nil {
+		return
+	}
+	if st, ok := s.endpointStatus(e.Name); ok {
+		e.Listening = st.Listening
+		e.LastError = st.LastError
+	}
+}
+
+// notifyEndpointChanged fires the ingress-layer hook, if wired.
+func (s *Service) notifyEndpointChanged(name string) {
+	if s.endpointHooks != nil {
+		s.endpointHooks.OnEndpointChanged(name)
+	}
+}
+
+// notifyEndpointDeleted fires the ingress-layer hook, if wired.
+func (s *Service) notifyEndpointDeleted(name string) {
+	if s.endpointHooks != nil {
+		s.endpointHooks.OnEndpointDeleted(name)
+	}
 }
 
 // PatchEndpoint applies a JSON merge-patch to an endpoint.
@@ -725,12 +829,21 @@ func (s *Service) PatchEndpoint(ctx context.Context, name string, patch []byte) 
 	if err := s.setDrifted(ctx, ports.KindEndpoint, e.Name); err != nil {
 		return Endpoint{}, err
 	}
+	s.notifyEndpointChanged(e.Name)
 	return e, nil
 }
 
 // DeleteEndpoint deletes an endpoint by name.
 func (s *Service) DeleteEndpoint(ctx context.Context, name string) error {
-	return s.store.Delete(ctx, ports.KindEndpoint, cleanName(name))
+	name = cleanName(name)
+	if name == DefaultEndpointName {
+		return asInvalid(fmt.Errorf("control: the default endpoint is read-only"))
+	}
+	if err := s.store.Delete(ctx, ports.KindEndpoint, name); err != nil {
+		return err
+	}
+	s.notifyEndpointDeleted(name)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -853,11 +966,13 @@ func (s *Service) GetPlatformSpec(ctx context.Context, id string) (ports.Platfor
 		ttl = DefaultStickyTTL
 	}
 	return ports.PlatformSpec{
-		ID:        p.ID,
-		Name:      p.Name,
-		Filter:    toPredicateFilter(p.Filter),
-		Policy:    policy,
-		StickyTTL: ttl,
+		ID:             p.ID,
+		Name:           p.Name,
+		Filter:         toPredicateFilter(p.Filter),
+		Policy:         policy,
+		StickyTTL:      ttl,
+		Allocation:     p.Allocation,
+		PassiveBreaker: p.PassiveBreaker,
 	}, nil
 }
 
@@ -925,6 +1040,8 @@ func toIdentityPolicy(p IdentityPolicy) (identity.Policy, error) {
 				rules = append(rules, identity.HeaderRule{Prefix: r.Prefix, Headers: r.Headers})
 			}
 			step = identity.HeaderRuleStep(rules)
+		case st.Resolver != nil:
+			step = identity.ResolverStep(*st.Resolver)
 		default:
 			return identity.Policy{}, fmt.Errorf("control: chain[%d]: no step variant set", i)
 		}

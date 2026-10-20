@@ -34,8 +34,7 @@ const (
 const APIVersion = "egress/v1"
 
 // DefaultStickyTTL is the lease TTL applied when a platform does not set
-// one. spec/resources/platform.md leaves it as TODO; this follows the
-// reference default RESIN_DEFAULT_PLATFORM_STICKY_TTL=168h.
+// one (spec/resources/platform.md).
 const DefaultStickyTTL = 168 * time.Hour
 
 // Allocation policies (spec/resources/platform.md).
@@ -217,6 +216,11 @@ type Endpoint struct {
 	AllowSOCKS5          bool   `json:"allow_socks5" yaml:"allowSOCKS5"`
 	CreatedAtNs          int64  `json:"created_at_ns,omitempty" yaml:"-"`
 	UpdatedAtNs          int64  `json:"updated_at_ns,omitempty" yaml:"-"`
+
+	// Runtime-decorated fields (never stored):
+	ReadOnly  bool   `json:"read_only" yaml:"-"`            // synthesized env default endpoint
+	Listening bool   `json:"listening" yaml:"-"`            // listener currently bound
+	LastError string `json:"last_error,omitempty" yaml:"-"` // last bind failure
 }
 
 // PolicyStep is one link of an IdentityPolicy chain
@@ -225,6 +229,9 @@ type PolicyStep struct {
 	Header     *string         `json:"header,omitempty" yaml:"header,omitempty"`
 	Wire       *struct{}       `json:"wire,omitempty" yaml:"wire,omitempty"`
 	HeaderRule *HeaderRuleSpec `json:"headerRule,omitempty" yaml:"headerRule,omitempty"`
+	// Resolver names a registered ext.IdentityResolver
+	// (spec/ext-abi.md §2); unregistered names resolve to "".
+	Resolver *string `json:"resolver,omitempty" yaml:"resolver,omitempty"`
 }
 
 // HeaderRuleSpec is the headerRule step body.
@@ -325,20 +332,21 @@ type Lease struct {
 // RequestLogEntry mirrors the openapi RequestLogEntry schema
 // (runtime-owned; served via backend).
 type RequestLogEntry struct {
-	TsNs       int64  `json:"ts_ns"`
-	ProxyType  string `json:"proxy_type"`
-	Platform   string `json:"platform"`
-	Account    string `json:"account"`
-	Target     string `json:"target"`
-	Node       string `json:"node"`
-	EgressIP   string `json:"egress_ip"`
-	NetOk      bool   `json:"net_ok"`
-	HTTPStatus int    `json:"http_status"`
-	Stage      string `json:"stage"`
-	ResinError string `json:"resin_error"`
-	DurationMs int64  `json:"duration_ms"`
-	BytesUp    int64  `json:"bytes_up"`
-	BytesDown  int64  `json:"bytes_down"`
+	ID          string `json:"id"`
+	TsNs        int64  `json:"ts_ns"`
+	ProxyType   string `json:"proxy_type"`
+	Platform    string `json:"platform"`
+	Account     string `json:"account"`
+	Target      string `json:"target"`
+	Node        string `json:"node"`
+	EgressIP    string `json:"egress_ip"`
+	NetOk       bool   `json:"net_ok"`
+	HTTPStatus  int    `json:"http_status"`
+	Stage       string `json:"stage"`
+	EgressError string `json:"egress_error"`
+	DurationMs  int64  `json:"duration_ms"`
+	BytesUp     int64  `json:"bytes_up"`
+	BytesDown   int64  `json:"bytes_down"`
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,10 +29,17 @@ type memRegistry struct {
 }
 
 func (m *memRegistry) ApplySnapshot(source string, nodes []pknode.NodeSnapshot) {}
-func (m *memRegistry) SnapshotOf(source string) []pknode.NodeSnapshot            { return nil }
+func (m *memRegistry) SnapshotOf(source string) []pknode.NodeSnapshot           { return nil }
 func (m *memRegistry) UpdateHealth(h pknode.Hash, health pknode.Health)         {}
-func (m *memRegistry) Get(h pknode.Hash) (pknode.NodeSnapshot, bool)            { return pknode.NodeSnapshot{}, false }
-func (m *memRegistry) All() []pknode.NodeSnapshot                               { return m.nodes }
+func (m *memRegistry) UpdateEgressIP(h pknode.Hash, ip netip.Addr)              {}
+func (m *memRegistry) UpdateLatency(h pknode.Hash, latency time.Duration)       {}
+func (m *memRegistry) UpdateAttrs(pknode.Hash, map[pknode.AttrKey]pknode.AttrValue) {
+}
+func (m *memRegistry) SetOnNodeChange(func(h pknode.Hash, removed bool)) {}
+func (m *memRegistry) Get(h pknode.Hash) (pknode.NodeSnapshot, bool) {
+	return pknode.NodeSnapshot{}, false
+}
+func (m *memRegistry) All() []pknode.NodeSnapshot { return m.nodes }
 
 func TestProbeSchedulerFiresProbes(t *testing.T) {
 	var h pknode.Hash

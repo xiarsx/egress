@@ -1,7 +1,10 @@
 package pick
 
 import (
+	"os"
+
 	"errors"
+	"gopkg.in/yaml.v3"
 	"math/rand/v2"
 	"net/netip"
 	"testing"
@@ -102,89 +105,98 @@ func runP2C(t *testing.T, v *fakeView, n *fakeNodes, l *fakeLoads, lat *fakeLate
 	return h
 }
 
-// --- scoring vectors (spec/vectors/p2c_scoring_vectors.yaml) ---
+// --- scoring vectors: executed directly from
+// spec/vectors/p2c_scoring_vectors.yaml (the spec is the source of truth;
+// no hand-mirrored copies) ---
 
-func TestP2C_BalancedPrefersLowerProduct(t *testing.T) {
-	a, b := hashOf(1), hashOf(2)
-	v, n, l, lat := p2cFixture(t, []pknode.Hash{a, b},
-		map[pknode.Hash]map[string]time.Duration{
-			a: {"example.com": 50 * time.Millisecond},
-			b: {"example.com": 20 * time.Millisecond},
-		},
-		map[pknode.Hash]int64{a: 2, b: 5})
-	// A: (2+1)*50=150, B: (5+1)*20=120 → B
-	if got := runP2C(t, v, n, l, lat, Policy{Allocation: AllocationBalanced}, "example.com"); got != b {
-		t.Fatalf("got %v, want B", got)
+func TestP2C_ConformanceVectors(t *testing.T) {
+	// Candidate ids map to deterministic hashes (A → 1, B → 2, C → 3).
+	idHash := func(id string) pknode.Hash {
+		if len(id) != 1 || id[0] < 'A' || id[0] > 'Z' {
+			t.Fatalf("vector candidate id %q: executor supports single letters", id)
+		}
+		return hashOf(byte(id[0]-'A') + 1)
+	}
+	const authority = "cloudflare.com" // executor's authority-domain fixture
+
+	for _, v := range loadP2CVectors(t) {
+		t.Run(v.Name, func(t *testing.T) {
+			var picks []pknode.Hash
+			lat := map[pknode.Hash]map[string]time.Duration{}
+			loads := map[pknode.Hash]int64{}
+			for _, c := range v.Candidates {
+				h := idHash(c.ID)
+				picks = append(picks, h)
+				loads[h] = c.LeaseCount
+				if c.LatencyMs != nil {
+					domain := v.Target
+					if c.LatencyKind == "common_authority_mean" {
+						domain = authority
+					} else if c.LatencyKind != "target_domain" {
+						t.Fatalf("unknown latencyKind %q", c.LatencyKind)
+					}
+					lat[h] = map[string]time.Duration{
+						domain: time.Duration(*c.LatencyMs) * time.Millisecond,
+					}
+				}
+			}
+			pol := Policy{Allocation: v.allocation(t), Authorities: []string{authority}}
+			fv, n, l, la := p2cFixture(t, picks, lat, loads)
+			if got := runP2C(t, fv, n, l, la, pol, v.Target); got != idHash(v.Expect) {
+				t.Fatalf("winner = %v, want %s (yaml scores: %+v)", got, v.Expect, v.Scores)
+			}
+		})
 	}
 }
 
-func TestP2C_NoLatencyFallsBackToLeaseCount(t *testing.T) {
-	a, b := hashOf(1), hashOf(2)
-	v, n, l, lat := p2cFixture(t, []pknode.Hash{a, b},
-		map[pknode.Hash]map[string]time.Duration{
-			b: {"example.com": 20 * time.Millisecond}, // A has none
-		},
-		map[pknode.Hash]int64{a: 2, b: 5})
-	// Incomparable caliber → score = leaseCount → A(2) < B(5) → A
-	if got := runP2C(t, v, n, l, lat, Policy{Allocation: AllocationBalanced}, "example.com"); got != a {
-		t.Fatalf("got %v, want A", got)
-	}
+// --- yaml loader (spec/vectors is the normative conformance source) ---
+
+type p2cVectorFile struct {
+	Vectors []p2cVector `yaml:"vectors"`
 }
 
-func TestP2C_CommonAuthorityMean(t *testing.T) {
-	a, b := hashOf(1), hashOf(2)
-	v, n, l, lat := p2cFixture(t, []pknode.Hash{a, b},
-		map[pknode.Hash]map[string]time.Duration{
-			a: {"cloudflare.com": 100 * time.Millisecond},
-			b: {"cloudflare.com": 40 * time.Millisecond},
-		},
-		map[pknode.Hash]int64{a: 0, b: 0})
-	pol := Policy{Allocation: AllocationBalanced, Authorities: []string{"cloudflare.com"}}
-	// A: (0+1)*100=100, B: (0+1)*40=40 → B
-	if got := runP2C(t, v, n, l, lat, pol, "other.example"); got != b {
-		t.Fatalf("got %v, want B", got)
-	}
+type p2cVector struct {
+	Name       string `yaml:"name"`
+	Allocation string `yaml:"allocation"`
+	Target     string `yaml:"target"`
+	Candidates []struct {
+		ID          string `yaml:"id"`
+		LeaseCount  int64  `yaml:"leaseCount"`
+		LatencyMs   *int   `yaml:"latencyMs"`
+		LatencyKind string `yaml:"latencyKind"`
+	} `yaml:"candidates"`
+	Scores map[string]int `yaml:"scores"`
+	Expect string         `yaml:"expect"`
 }
 
-func TestP2C_PreferLowLatencyIgnoresLeaseCount(t *testing.T) {
-	a, b := hashOf(1), hashOf(2)
-	v, n, l, lat := p2cFixture(t, []pknode.Hash{a, b},
-		map[pknode.Hash]map[string]time.Duration{
-			a: {"example.com": 50 * time.Millisecond},
-			b: {"example.com": 20 * time.Millisecond},
-		},
-		map[pknode.Hash]int64{a: 0, b: 9})
-	if got := runP2C(t, v, n, l, lat, Policy{Allocation: AllocationPreferLowLatency}, "example.com"); got != b {
-		t.Fatalf("got %v, want B", got)
+func loadP2CVectors(t *testing.T) []p2cVector {
+	t.Helper()
+	raw, err := os.ReadFile("../../../spec/vectors/p2c_scoring_vectors.yaml")
+	if err != nil {
+		t.Fatalf("read vectors: %v", err)
 	}
+	var f p2cVectorFile
+	if err := yaml.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse vectors: %v", err)
+	}
+	if len(f.Vectors) == 0 {
+		t.Fatal("no vectors loaded")
+	}
+	return f.Vectors
 }
 
-func TestP2C_PreferIdleIPIgnoresLatency(t *testing.T) {
-	a, b := hashOf(1), hashOf(2)
-	v, n, l, lat := p2cFixture(t, []pknode.Hash{a, b},
-		map[pknode.Hash]map[string]time.Duration{
-			a: {"example.com": 50 * time.Millisecond},
-			b: {"example.com": 20 * time.Millisecond},
-		},
-		map[pknode.Hash]int64{a: 2, b: 5})
-	if got := runP2C(t, v, n, l, lat, Policy{Allocation: AllocationPreferIdleIP}, "example.com"); got != a {
-		t.Fatalf("got %v, want A", got)
-	}
-}
-
-func TestP2C_MixedCaliberFallsBackToLeaseCount(t *testing.T) {
-	a, b := hashOf(1), hashOf(2)
-	v, n, l, lat := p2cFixture(t, []pknode.Hash{a, b},
-		map[pknode.Hash]map[string]time.Duration{
-			a: {"example.com": 30 * time.Millisecond},     // target-domain
-			b: {"cloudflare.com": 200 * time.Millisecond}, // authority mean
-		},
-		map[pknode.Hash]int64{a: 3, b: 1})
-	pol := Policy{Allocation: AllocationBalanced, Authorities: []string{"cloudflare.com"}}
-	// A lacks authority data and B lacks target data → incomparable →
-	// leaseCount only → B(1) < A(3) → B
-	if got := runP2C(t, v, n, l, lat, pol, "example.com"); got != b {
-		t.Fatalf("got %v, want B", got)
+func (v p2cVector) allocation(t *testing.T) Allocation {
+	t.Helper()
+	switch v.Allocation {
+	case "BALANCED":
+		return AllocationBalanced
+	case "PREFER_LOW_LATENCY":
+		return AllocationPreferLowLatency
+	case "PREFER_IDLE_IP":
+		return AllocationPreferIdleIP
+	default:
+		t.Fatalf("unknown allocation %q", v.Allocation)
+		return 0
 	}
 }
 

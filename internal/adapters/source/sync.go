@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xiarsx/egress/internal/ports"
+	"github.com/xiarsx/egress/pkg/ext"
 	pknode "github.com/xiarsx/egress/pkg/node"
 )
 
@@ -101,16 +102,58 @@ func NewSyncer(reg *Registry, fetcher ports.Fetcher, sched ports.Scheduler, pars
 	}
 }
 
-// providerFor resolves the built-in provider for a source kind.
-func (s *Syncer) providerFor(kind string) (Provider, error) {
+// nodeProvider yields parsed node snapshots (built-ins fetch bytes and
+// run them through the Syncer's parser; ext providers return snapshots
+// directly — spec/ext-abi.md §2).
+type nodeProvider interface {
+	FetchNodes(ctx context.Context, spec ports.SourceSpec) ([]pknode.NodeSnapshot, error)
+}
+
+// providerFor resolves the provider for a source kind: built-ins first,
+// then registered ext.SourceProviders. An unknown kind fails closed with
+// an error surfaced in the source's LastError.
+func (s *Syncer) providerFor(kind string) (nodeProvider, error) {
 	switch kind {
 	case "remote":
-		return s.remotes, nil
+		return &byteProvider{prov: s.remotes, parse: s.parse}, nil
 	case "local":
-		return localProvider{}, nil
+		return &byteProvider{prov: localProvider{}, parse: s.parse}, nil
 	default:
+		if p, ok := ext.GetSourceProvider(kind); ok {
+			return &extProvider{p: p, kind: kind}, nil
+		}
 		return nil, fmt.Errorf("source: unknown source kind %q", kind)
 	}
+}
+
+// byteProvider adapts a byte-fetching Provider + parser to nodeProvider.
+type byteProvider struct {
+	prov  Provider
+	parse func([]byte) ([]pknode.NodeSnapshot, error)
+}
+
+func (b *byteProvider) FetchNodes(ctx context.Context, spec ports.SourceSpec) ([]pknode.NodeSnapshot, error) {
+	body, err := b.prov.Fetch(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return b.parse(body)
+}
+
+// extProvider adapts a registered ext.SourceProvider.
+type extProvider struct {
+	p    ext.SourceProvider
+	kind string
+}
+
+func (e *extProvider) FetchNodes(ctx context.Context, spec ports.SourceSpec) ([]pknode.NodeSnapshot, error) {
+	return e.p.Fetch(ctx, ext.SourceSpec{
+		Name:           spec.Name,
+		Kind:           e.kind,
+		URL:            spec.URL,
+		Content:        spec.Content,
+		UpdateInterval: spec.UpdateInterval,
+	})
 }
 
 // AddSource registers a source, refreshes it once immediately (async), and
@@ -225,14 +268,9 @@ func (s *Syncer) refreshOnceWithCtx(ctx context.Context, name string) error {
 		s.recordError(name, err)
 		return err
 	}
-	body, err := prov.Fetch(ctx, spec)
+	nodes, err := prov.FetchNodes(ctx, spec)
 	if err != nil {
 		// Keep the old snapshot; record the failure.
-		s.recordError(name, err)
-		return err
-	}
-	nodes, err := s.parse(body)
-	if err != nil {
 		s.recordError(name, err)
 		return err
 	}

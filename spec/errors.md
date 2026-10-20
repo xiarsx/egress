@@ -1,21 +1,21 @@
 # 错误契约（Error Contract）
 
-> 状态：**stable**。错误码与映射关系保持与 Resin 兼容；新增错误码必须走 RFC。
+> 状态：**stable**。错误码与映射关系是稳定契约；新增错误码必须走 RFC。
 > 完整错误场景向量见 [vectors/error_scenarios.yaml](./vectors/error_scenarios.yaml)。
 
-代理错误同时使用标准 HTTP 状态码与 `X-Resin-Error` 响应头（程序化识别），
+代理错误同时使用标准 HTTP 状态码与 `X-Egress-Error` 响应头（程序化识别），
 Body 为纯文本（`text/plain; charset=utf-8`）的人类可读描述。
 
-- `X-Resin-Error` 头名在 V1 中**保持不变**（兼容 Resin 客户端）。
-- 407 响应附加 `Proxy-Authenticate: Basic realm="Resin"` 头。
-- SOCKS5 入口不返回 HTTP 状态码或 `X-Resin-Error` 头，使用 RFC1928/RFC1929
-  协议回复；更细粒度的 `resin_error` / `upstream_stage` 只记录在请求日志中。
+- `X-Egress-Error` 头名在 V1 中**保持不变**（破坏性变更必须走 RFC）。
+- 407 响应附加 `Proxy-Authenticate: Basic realm="egress"` 头。
+- SOCKS5 入口不返回 HTTP 状态码或 `X-Egress-Error` 头，使用 RFC1928/RFC1929
+  协议回复；更细粒度的 `egress_error` / `upstream_stage` 只记录在请求日志中。
 
-## 1. HTTP 入口：X-Resin-Error 枚举与状态码
+## 1. HTTP 入口：X-Egress-Error 枚举与状态码
 
 ### 1.1 认证阶段
 
-| X-Resin-Error | HTTP | 场景 | 说明 |
+| X-Egress-Error | HTTP | 场景 | 说明 |
 |---|---|---|---|
 | `AUTH_REQUIRED` | 407 | PROXY_TOKEN 缺失或格式错误（HTTP 正向） | 未提供 `Proxy-Authorization` 头或格式不正确；附加 `Proxy-Authenticate` 头 |
 | `AUTH_FAILED` | 403 | Token 校验失败（HTTP 正向） | 格式正确但 Token 不匹配 |
@@ -23,7 +23,7 @@ Body 为纯文本（`text/plain; charset=utf-8`）的人类可读描述。
 
 ### 1.2 反向代理 URL 解析
 
-| X-Resin-Error | HTTP | 场景 | 说明 |
+| X-Egress-Error | HTTP | 场景 | 说明 |
 |---|---|---|---|
 | `URL_PARSE_ERROR` | 400 | 路径段不足 | 至少需要 `protocol/host` 两段（连 Token 共 4 段） |
 | `URL_PARSE_ERROR` | 400 | 身份段解码失败 | Path Segment 百分号解码失败 |
@@ -32,7 +32,7 @@ Body 为纯文本（`text/plain; charset=utf-8`）的人类可读描述。
 
 ### 1.3 路由阶段
 
-| X-Resin-Error | HTTP | 场景 | 说明 |
+| X-Egress-Error | HTTP | 场景 | 说明 |
 |---|---|---|---|
 | `PLATFORM_NOT_FOUND` | 404 | Platform 不存在 | 解析出的 Platform 名找不到对应 Platform |
 | `ACCOUNT_REJECTED` | 403 | Account 提取失败且策略为拒绝 | IdentityPolicy `onMiss: reject` |
@@ -40,7 +40,7 @@ Body 为纯文本（`text/plain; charset=utf-8`）的人类可读描述。
 
 ### 1.4 上游连接 / 请求
 
-| X-Resin-Error | HTTP | 场景 | 说明 |
+| X-Egress-Error | HTTP | 场景 | 说明 |
 |---|---|---|---|
 | `UPSTREAM_CONNECT_FAILED` | 502 | Dial 上游失败 | CONNECT 拨号阶段失败（连接被拒、网络不可达、RST 等） |
 | `UPSTREAM_TIMEOUT` | 504 | 上游超时 | 连接上游或等待上游响应超时（含 context deadline） |
@@ -50,9 +50,15 @@ Body 为纯文本（`text/plain; charset=utf-8`）的人类可读描述。
 握手失败、超时、RST 为 fail。客户端主动取消（`context.Canceled`）不计为
 节点失败，不产生代理错误。
 
-### 1.5 内部错误
+### 1.5 入口能力
 
-| X-Resin-Error | HTTP | 场景 |
+| X-Egress-Error | HTTP | 场景 | 说明 |
+|---|---|---|---|
+| `ENDPOINT_CAPABILITY_DISABLED` | 403 | 请求命中的 Endpoint 未开启对应能力 | Endpoint 关闭 `allowHTTPForward` / `allowHTTPReverse` / `allowSOCKS5` 或 `allowProxy` 时，相应入口返回 403；管理面路径（`/api`、`/ui`）在 `allowManagement: false` 时返回 404 不暴露本码（见 [resources/endpoint.md](./resources/endpoint.md)） |
+
+### 1.6 内部错误
+
+| X-Egress-Error | HTTP | 场景 |
 |---|---|---|
 | `INTERNAL_ERROR` | 500 | 未分类的内部错误（路由层未知错误等） |
 
@@ -61,7 +67,7 @@ Body 为纯文本（`text/plain; charset=utf-8`）的人类可读描述。
 SOCKS5 正向代理只支持 `CONNECT`。所有路由/上游类错误在协议面统一暴露为
 `REP=0x01`（GENERAL FAILURE）。
 
-| 场景 | 协议回复 | 对应 X-Resin-Error（仅记日志） |
+| 场景 | 协议回复 | 对应 X-Egress-Error（仅记日志） |
 |---|---|---|
 | 客户端未提供可接受的认证方法 | 方法协商回复 `0x05 0xFF` | `AUTH_REQUIRED` |
 | RFC1929 用户名密码认证失败 | 子协商回复 `0x01 0x01` | `AUTH_FAILED` |
@@ -83,8 +89,8 @@ SOCKS5 正向代理只支持 `CONNECT`。所有路由/上游类错误在协议�
 
 ```
 HTTP/1.1 407 Proxy Authentication Required
-Proxy-Authenticate: Basic realm="Resin"
-X-Resin-Error: AUTH_REQUIRED
+Proxy-Authenticate: Basic realm="egress"
+X-Egress-Error: AUTH_REQUIRED
 Content-Type: text/plain; charset=utf-8
 
 Proxy authentication required
@@ -94,7 +100,7 @@ Proxy authentication required
 
 ```
 HTTP/1.1 503 Service Unavailable
-X-Resin-Error: NO_AVAILABLE_NODES
+X-Egress-Error: NO_AVAILABLE_NODES
 Content-Type: text/plain; charset=utf-8
 
 No available nodes for routing

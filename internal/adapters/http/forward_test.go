@@ -3,7 +3,6 @@ package forward
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -12,86 +11,32 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/xiarsx/egress/internal/app/pipeline"
-	"github.com/xiarsx/egress/internal/core/identity"
 	"github.com/xiarsx/egress/internal/core/lease"
 	pick "github.com/xiarsx/egress/internal/core/select"
 	"github.com/xiarsx/egress/internal/core/view"
+	"github.com/xiarsx/egress/internal/testutil/pipefake"
 	pknode "github.com/xiarsx/egress/pkg/node"
-	pksignal "github.com/xiarsx/egress/pkg/signal"
 )
 
-// --- minimal fakes (mirrors pipeline tests) ---
-
-type fakeClock struct{ t time.Time }
-
-func (f *fakeClock) Now() time.Time { return f.t }
-
-type fakeResolver struct{ id string }
-
-func (f *fakeResolver) ResolvePlatform(name string) (string, bool) {
-	if name == "Default" {
-		return f.id, true
-	}
-	return "", false
-}
-func (f *fakeResolver) PolicyFor(string) *identity.Policy { return nil }
-
-type fakeBus struct{}
-
-func (b *fakeBus) Emit(pksignal.Signal)              {}
-func (b *fakeBus) Subscribe() <-chan pksignal.Signal { return nil }
-
-type fakeDialer struct {
-	mu    sync.Mutex
-	err   error
-	seen  []string
-	serve func(net.Conn)
-}
-
-func (f *fakeDialer) DialContext(ctx context.Context, h pknode.Hash, network, address string) (net.Conn, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	f.mu.Lock()
-	f.seen = append(f.seen, address)
-	f.mu.Unlock()
-	up, peer := net.Pipe()
-	go func() {
-		if f.serve != nil {
-			f.serve(peer)
-		} else {
-			_, _ = io.Copy(io.Discard, peer)
-		}
-	}()
-	return up, nil
-}
-
-type fakeDirect struct{}
-
-func (f *fakeDirect) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	return nil, errors.New("no direct")
-}
-
 var (
-	testHash   = pknode.Hash{9, 9, 9}
+	testHash   = pknode.Hash{3, 3, 3}
 	testPlatID = "test-platform-id"
 )
 
-func newPipeline(t *testing.T, token string, d *fakeDialer) *pipeline.Pipeline {
+func newPipeline(t *testing.T, token string, d *pipefake.Dialer) *pipeline.Pipeline {
 	t.Helper()
 	snap := pknode.NodeSnapshot{Hash: testHash, EgressIP: netip.MustParseAddr("198.51.100.9"), HasOutbound: true, Health: pknode.HealthyHealth(0)}
 	v := view.Derive([]pknode.NodeSnapshot{snap}, nil)
 	return pipeline.New(pipeline.Deps{
-		Resolver:   &fakeResolver{id: testPlatID},
+		Resolver:   &pipefake.Resolver{ID: testPlatID},
 		NodeDialer: d,
-		Direct:     &fakeDirect{},
-		Bus:        &fakeBus{},
-		Clock:      &fakeClock{t: time.Now()},
+		Direct:     &pipefake.Direct{},
+		Bus:        &pipefake.Bus{},
+		Clock:      &pipefake.Clock{T: time.Now()},
 		Leases:     lease.NewLeaseTable(),
 		Views:      func(string) *view.View { return v },
 		Nodes: func(h pknode.Hash) (pknode.NodeSnapshot, bool) {
@@ -100,11 +45,11 @@ func newPipeline(t *testing.T, token string, d *fakeDialer) *pipeline.Pipeline {
 			}
 			return pknode.NodeSnapshot{}, false
 		},
-		Latency:    func(pknode.Hash, string) (time.Duration, bool) { return 0, false },
-		IPLoad:     func(string, netip.Addr) int64 { return 0 },
-		PickPolicy: pick.Policy{Allocation: pick.AllocationBalanced},
-		Rand:       rand.New(rand.NewPCG(7, 7)),
-		ProxyToken: token,
+		Latency:       func(pknode.Hash, string) (time.Duration, bool) { return 0, false },
+		IPLoad:        func(string, netip.Addr) int64 { return 0 },
+		PickPolicyFor: func(string) pick.Policy { return pick.Policy{Allocation: pick.AllocationBalanced} },
+		Rand:          rand.New(rand.NewPCG(7, 7)),
+		ProxyToken:    token,
 	})
 }
 
@@ -119,7 +64,7 @@ func startServer(t *testing.T, p *pipeline.Pipeline) net.Addr {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go New(p).Serve(l)
+	go (&http.Server{Handler: New(p)}).Serve(l)
 	return l.Addr()
 }
 
@@ -146,7 +91,7 @@ func readStatusHead(t *testing.T, br *bufio.Reader) (status string, headers map[
 }
 
 func TestConnectTunnel(t *testing.T) {
-	d := &fakeDialer{serve: func(up net.Conn) {
+	d := &pipefake.Dialer{Serve: func(up net.Conn) {
 		defer up.Close()
 		_, _ = io.Copy(up, up) // echo
 	}}
@@ -178,13 +123,13 @@ func TestConnectTunnel(t *testing.T) {
 	if string(got) != "hello" {
 		t.Fatalf("echo = %q", got)
 	}
-	if len(d.seen) != 1 || d.seen[0] != "example.com:443" {
-		t.Fatalf("dialed = %v", d.seen)
+	if len(d.Seen) != 1 || d.Seen[0] != "example.com:443" {
+		t.Fatalf("dialed = %v", d.Seen)
 	}
 }
 
 func TestConnectDialFailure(t *testing.T) {
-	d := &fakeDialer{err: errors.New("connection refused")}
+	d := &pipefake.Dialer{Err: errors.New("connection refused")}
 	addr := startServer(t, newPipeline(t, "tok", d))
 
 	conn, err := net.Dial("tcp", addr.String())
@@ -202,13 +147,13 @@ func TestConnectDialFailure(t *testing.T) {
 	if !strings.HasPrefix(status, "HTTP/1.1 502") {
 		t.Fatalf("status = %q", status)
 	}
-	if headers["X-Resin-Error"] != "UPSTREAM_CONNECT_FAILED" {
-		t.Fatalf("X-Resin-Error = %q", headers["X-Resin-Error"])
+	if headers["X-Egress-Error"] != "UPSTREAM_CONNECT_FAILED" {
+		t.Fatalf("X-Egress-Error = %q", headers["X-Egress-Error"])
 	}
 }
 
 func TestConnectAuth(t *testing.T) {
-	addr := startServer(t, newPipeline(t, "tok", &fakeDialer{}))
+	addr := startServer(t, newPipeline(t, "tok", &pipefake.Dialer{}))
 
 	dial := func(t *testing.T) (net.Conn, *bufio.Reader) {
 		t.Helper()
@@ -227,8 +172,8 @@ func TestConnectAuth(t *testing.T) {
 		if !strings.HasPrefix(status, "HTTP/1.1 407") {
 			t.Fatalf("status = %q", status)
 		}
-		if headers["X-Resin-Error"] != "AUTH_REQUIRED" {
-			t.Fatalf("X-Resin-Error = %q", headers["X-Resin-Error"])
+		if headers["X-Egress-Error"] != "AUTH_REQUIRED" {
+			t.Fatalf("X-Egress-Error = %q", headers["X-Egress-Error"])
 		}
 		if headers["Proxy-Authenticate"] == "" {
 			t.Fatal("missing Proxy-Authenticate")
@@ -242,8 +187,8 @@ func TestConnectAuth(t *testing.T) {
 		if !strings.HasPrefix(status, "HTTP/1.1 403") {
 			t.Fatalf("status = %q", status)
 		}
-		if headers["X-Resin-Error"] != "AUTH_FAILED" {
-			t.Fatalf("X-Resin-Error = %q", headers["X-Resin-Error"])
+		if headers["X-Egress-Error"] != "AUTH_FAILED" {
+			t.Fatalf("X-Egress-Error = %q", headers["X-Egress-Error"])
 		}
 	})
 	t.Run("malformed header", func(t *testing.T) {
@@ -254,15 +199,15 @@ func TestConnectAuth(t *testing.T) {
 		if !strings.HasPrefix(status, "HTTP/1.1 407") {
 			t.Fatalf("status = %q", status)
 		}
-		if headers["X-Resin-Error"] != "AUTH_REQUIRED" {
-			t.Fatalf("X-Resin-Error = %q", headers["X-Resin-Error"])
+		if headers["X-Egress-Error"] != "AUTH_REQUIRED" {
+			t.Fatalf("X-Egress-Error = %q", headers["X-Egress-Error"])
 		}
 	})
 }
 
 func TestPlainForward(t *testing.T) {
 	headCh := make(chan []byte, 1)
-	d := &fakeDialer{serve: func(up net.Conn) {
+	d := &pipefake.Dialer{Serve: func(up net.Conn) {
 		defer up.Close()
 		br := bufio.NewReader(up)
 		var head []byte
@@ -289,11 +234,19 @@ func TestPlainForward(t *testing.T) {
 	if _, err := io.WriteString(conn, raw); err != nil {
 		t.Fatal(err)
 	}
-	// Upstream must receive the verbatim head.
+	// Upstream must receive the re-serialized origin-form head, with the
+	// proxy credentials stripped.
 	select {
 	case head := <-headCh:
-		if string(head) != raw {
-			t.Fatalf("upstream head = %q, want %q", head, raw)
+		hs := string(head)
+		if !strings.HasPrefix(hs, "GET /p?q=1 HTTP/1.1\r\n") {
+			t.Fatalf("upstream head first line = %q", hs)
+		}
+		if strings.Contains(hs, "Proxy-Authorization") {
+			t.Fatalf("credentials must not travel upstream: %q", hs)
+		}
+		if !strings.Contains(hs, "Host: example.com\r\n") {
+			t.Fatalf("missing Host header: %q", hs)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("upstream never got the head")
@@ -311,7 +264,7 @@ func TestPlainForward(t *testing.T) {
 }
 
 func TestPlainPlatformNotFound(t *testing.T) {
-	addr := startServer(t, newPipeline(t, "tok", &fakeDialer{}))
+	addr := startServer(t, newPipeline(t, "tok", &pipefake.Dialer{}))
 	conn, err := net.Dial("tcp", addr.String())
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +277,57 @@ func TestPlainPlatformNotFound(t *testing.T) {
 	if !strings.HasPrefix(status, "HTTP/1.1 404") {
 		t.Fatalf("status = %q", status)
 	}
-	if headers["X-Resin-Error"] != "PLATFORM_NOT_FOUND" {
-		t.Fatalf("X-Resin-Error = %q", headers["X-Resin-Error"])
+	if headers["X-Egress-Error"] != "PLATFORM_NOT_FOUND" {
+		t.Fatalf("X-Egress-Error = %q", headers["X-Egress-Error"])
 	}
+}
+
+// TestRequireAuthInfo: with an empty proxy token (auth disabled) and
+// RequireProxyAuthInfo set, requests without Proxy-Authorization get 407;
+// any well-formed credential passes the local gate (password unchecked).
+func TestRequireAuthInfo(t *testing.T) {
+	srv := New(newPipeline(t, "", &pipefake.Dialer{}))
+	srv.RequireAuthInfo = true
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go (&http.Server{Handler: srv}).Serve(l)
+	addr := l.Addr().String()
+
+	t.Run("missing header is 407", func(t *testing.T) {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_, _ = io.WriteString(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n")
+		status, headers := readStatusHead(t, bufio.NewReader(conn))
+		if !strings.HasPrefix(status, "HTTP/1.1 407") {
+			t.Fatalf("status = %q", status)
+		}
+		if headers["X-Egress-Error"] != "AUTH_REQUIRED" {
+			t.Fatalf("X-Egress-Error = %q", headers["X-Egress-Error"])
+		}
+	})
+	t.Run("any credential passes the gate", func(t *testing.T) {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		// Password is NOT validated in no-auth mode; identity is enough.
+		_, _ = io.WriteString(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n"+
+			"Proxy-Authorization: "+basicAuth("Default.alice", "anything")+"\r\n\r\n")
+		status, headers := readStatusHead(t, bufio.NewReader(conn))
+		// The pipeline then resolves the platform — the fake resolver
+		// knows "Default", so the dial fails (no upstream), NOT 407.
+		if strings.HasPrefix(status, "HTTP/1.1 407") {
+			t.Fatalf("credential must pass the gate, got %q", status)
+		}
+		if headers["X-Egress-Error"] == "AUTH_REQUIRED" {
+			t.Fatalf("X-Egress-Error = %q, want a post-auth failure", headers["X-Egress-Error"])
+		}
+	})
 }

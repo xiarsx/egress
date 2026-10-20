@@ -10,6 +10,7 @@ package lease
 
 import (
 	"net/netip"
+	"strings"
 	"sync"
 
 	pklease "github.com/xiarsx/egress/pkg/lease"
@@ -90,6 +91,20 @@ func (t *LeaseTable) IPLoad(platform string, ip netip.Addr) int64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.ipLoad[ipLoadKey(platform, ip)]
+}
+
+// Count returns the number of leases held by one platform.
+func (t *LeaseTable) Count(platform string) int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var n int64
+	prefix := platform + "\x00"
+	for k := range t.leases {
+		if strings.HasPrefix(k, prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // Len returns the number of leases in the table.

@@ -10,9 +10,9 @@ Signal 是一次**网络事实**：被动流量、主动探测、资源下载统
 CacheSink。各消费者相互独立——删掉任何一个，数据面零感知。
 
 ```
-Signal = Egress  { node, at, ip? }                    // ip=None 即失败
-       | Latency { node, at, domain, ms?, authority }  // ms=None 即失败
-       | Traffic { node, at, platform, ok, tlsMs?, bytes, breakerExempt }
+Signal = Egress  { node, at, ip? }                        // ip=None 即失败
+       | Latency { node, at, domain, ms?, authority }      // ms=None 即失败
+       | Traffic { node, at, platform, ok, tlsMs?, bytesUp, bytesDown, breakerExempt }
 ```
 
 | 变体 | 字段 | 类型 | 说明 |
@@ -24,20 +24,18 @@ Signal = Egress  { node, at, ip? }                    // ip=None 即失败
 | | `at` | timestamp | 时间 |
 | | `domain` | string | 探测目标域名 |
 | | `ms` | float? | 延迟毫秒；`null` 即失败 |
-| | `authority` | string | 权威桶 key（eTLD+1，如 `cloudflare.com`） |
+| | `authority` | bool | `true` 表示该样本计入权威桶（TD-EWMA 常驻区），桶 key 由 `domain` 的 eTLD+1 决定 |
 | `Traffic` | `node` | NodeHash | 节点 |
 | | `at` | timestamp | 时间 |
 | | `platform` | PlatformID | 所属平台（用于 `passiveBreaker` 豁免判定） |
 | | `ok` | bool | 网络层建连成功即 `true`（即便 HTTP 500）；握手失败/超时/RST 为 `false` |
 | | `tlsMs` | float? | TLS 握手耗时（隧道流量：ClientHello 到首次读；反向代理：`httptrace` TLS 钩子；非 TLS 流量不计） |
-| | `bytes` | int | 传输字节数（上下行合计口径由实现定义，见 TODO） |
+| | `bytesUp` | int | 客户端 → 上游字节数 |
+| | `bytesDown` | int | 上游 → 客户端字节数 |
 | | `breakerExempt` | bool | 被动熔断豁免：Platform `passiveBreaker: off` 时数据面在发射时置 `true`，HealthProjector 跳过该失败计数 |
 
 **序列化约定**：JSON，`type` 字段取 `egress` / `latency` / `traffic`；
 时间统一为 Unix 纳秒（`at_ns`）。
-
-**TODO**：`Traffic.bytes` 的上下行拆分口径（`bytesUp`/`bytesDown` 还是合计）
-在 M2 内核实现时确定并回填。
 
 ## 2. RequestLog
 
@@ -55,7 +53,7 @@ Signal = Egress  { node, at, ip? }                    // ip=None 即失败
 | `netOk` | bool | 网络层是否成功 |
 | `httpStatus` | int | HTTP 状态码（隧道/SOCKS5 无意义时为 0） |
 | `stage` | string | 上游/网络失败发生的阶段（如 `dial` / `request` / `tunnel`） |
-| `resinError` | string | 逻辑代理错误码，见 [errors.md](./errors.md)（如 `UPSTREAM_TIMEOUT`；成功时为空） |
+| `egressError` | string | 逻辑代理错误码，见 [errors.md](./errors.md)（如 `UPSTREAM_TIMEOUT`；成功时为空） |
 | `durationMs` | int | 请求总耗时毫秒 |
 | `bytesUp` | int | 客户端 → 上游字节数（含头含体） |
 | `bytesDown` | int | 上游 → 客户端字节数（含头含体） |

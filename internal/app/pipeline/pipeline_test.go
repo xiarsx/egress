@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,104 +14,14 @@ import (
 	"github.com/xiarsx/egress/internal/core/lease"
 	pick "github.com/xiarsx/egress/internal/core/select"
 	"github.com/xiarsx/egress/internal/core/view"
+	"github.com/xiarsx/egress/internal/ports"
+	"github.com/xiarsx/egress/internal/testutil/pipefake"
+	"github.com/xiarsx/egress/pkg/ext"
 	pknode "github.com/xiarsx/egress/pkg/node"
 	pksignal "github.com/xiarsx/egress/pkg/signal"
 )
 
 // --- fakes ---
-
-type fakeClock struct{ t time.Time }
-
-func (f *fakeClock) Now() time.Time { return f.t }
-
-type fakeResolver struct {
-	platforms map[string]string // name → id
-	policies  map[string]*identity.Policy
-}
-
-func (f *fakeResolver) ResolvePlatform(name string) (string, bool) {
-	id, ok := f.platforms[name]
-	return id, ok
-}
-
-func (f *fakeResolver) PolicyFor(id string) *identity.Policy { return f.policies[id] }
-
-type fakeBus struct {
-	mu  sync.Mutex
-	got []pksignal.Signal
-}
-
-func (b *fakeBus) Emit(s pksignal.Signal) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.got = append(b.got, s)
-}
-func (b *fakeBus) Subscribe() <-chan pksignal.Signal { return nil }
-func (b *fakeBus) last() (pksignal.Signal, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.got) == 0 {
-		return pksignal.Signal{}, false
-	}
-	return b.got[len(b.got)-1], true
-}
-func (b *fakeBus) count() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.got)
-}
-
-// fakeNodeDialer dials a pipe; runEcho serves the far end with a canned
-// response after consuming the head.
-type fakeNodeDialer struct {
-	mu      sync.Mutex
-	hashes  []pknode.Hash
-	serve   func(up net.Conn)
-	dialErr error
-}
-
-func (f *fakeNodeDialer) DialContext(ctx context.Context, h pknode.Hash, network, address string) (net.Conn, error) {
-	if f.dialErr != nil {
-		return nil, f.dialErr
-	}
-	f.mu.Lock()
-	f.hashes = append(f.hashes, h)
-	f.mu.Unlock()
-	up, far := net.Pipe()
-	if f.serve != nil {
-		go f.serve(far)
-	} else {
-		// Discard everything and close: lets relay's upstream→client
-		// copy observe EOF instead of blocking forever.
-		go func() { _, _ = io.Copy(io.Discard, far); _ = far.Close() }()
-	}
-	return up, nil
-}
-
-func (f *fakeNodeDialer) dialed() []pknode.Hash {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]pknode.Hash(nil), f.hashes...)
-}
-
-type fakeDirect struct {
-	mu      sync.Mutex
-	targets []string
-	serve   func(up net.Conn)
-}
-
-func (f *fakeDirect) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	f.mu.Lock()
-	f.targets = append(f.targets, address)
-	f.mu.Unlock()
-	up, far := net.Pipe()
-	if f.serve != nil {
-		go f.serve(far)
-	} else {
-		go func() { _, _ = io.Copy(io.Discard, far); _ = far.Close() }()
-	}
-	return up, nil
-}
 
 var (
 	testHash   = pknode.Hash{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
@@ -128,26 +37,26 @@ var (
 
 type fixture struct {
 	p      *Pipeline
-	bus    *fakeBus
-	dialer *fakeNodeDialer
-	direct *fakeDirect
+	bus    *pipefake.Bus
+	dialer *pipefake.Dialer
+	direct *pipefake.Direct
 	leases *lease.LeaseTable
 	view   *view.View
-	clock  *fakeClock
+	clock  *pipefake.Clock
 }
 
 func newFixture(t *testing.T, mutate func(*Deps)) *fixture {
 	t.Helper()
 	v := view.Derive([]pknode.NodeSnapshot{testSnap}, nil)
-	bus := &fakeBus{}
-	dialer := &fakeNodeDialer{}
-	direct := &fakeDirect{}
+	bus := &pipefake.Bus{}
+	dialer := &pipefake.Dialer{}
+	direct := &pipefake.Direct{Allow: true}
 	leases := lease.NewLeaseTable()
-	clock := &fakeClock{t: time.Now()}
+	clock := &pipefake.Clock{T: time.Now()}
 	d := Deps{
-		Resolver: &fakeResolver{
-			platforms: map[string]string{"Default": testPlatID},
-			policies:  map[string]*identity.Policy{},
+		Resolver: &pipefake.Resolver{
+			Platforms: map[string]string{"Default": testPlatID},
+			Policies:  map[string]*identity.Policy{},
 		},
 		NodeDialer: dialer,
 		Direct:     direct,
@@ -161,11 +70,11 @@ func newFixture(t *testing.T, mutate func(*Deps)) *fixture {
 			}
 			return pknode.NodeSnapshot{}, false
 		},
-		Latency:    func(pknode.Hash, string) (time.Duration, bool) { return 0, false },
-		IPLoad:     func(string, netip.Addr) int64 { return 0 },
-		PickPolicy: pick.Policy{Allocation: pick.AllocationBalanced},
-		Rand:       rand.New(rand.NewPCG(42, 99)),
-		ProxyToken: "tok",
+		Latency:       func(pknode.Hash, string) (time.Duration, bool) { return 0, false },
+		IPLoad:        func(string, netip.Addr) int64 { return 0 },
+		PickPolicyFor: func(string) pick.Policy { return pick.Policy{Allocation: pick.AllocationBalanced} },
+		Rand:          rand.New(rand.NewPCG(42, 99)),
+		ProxyToken:    "tok",
 	}
 	if mutate != nil {
 		mutate(&d)
@@ -209,7 +118,7 @@ func runHandle(ctx context.Context, p *Pipeline, client net.Conn, req Request) <
 
 func TestHandleFullPath(t *testing.T) {
 	fx := newFixture(t, func(d *Deps) {
-		d.NodeDialer.(*fakeNodeDialer).serve = func(up net.Conn) { echoUpstream(t, up, len("HELLO")) }
+		d.NodeDialer.(*pipefake.Dialer).Serve = func(up net.Conn) { echoUpstream(t, up, len("HELLO")) }
 	})
 	client, server := net.Pipe()
 	defer server.Close()
@@ -247,12 +156,12 @@ func TestHandleFullPath(t *testing.T) {
 	}
 
 	// Node dialed by hash.
-	if hashes := fx.dialer.dialed(); len(hashes) != 1 || hashes[0] != testHash {
+	if hashes := fx.dialer.DialedHashes(); len(hashes) != 1 || hashes[0] != testHash {
 		t.Fatalf("dialed hashes = %v", hashes)
 	}
 
 	// Traffic signal: ok, byte counts, platform, node.
-	sig, ok := fx.bus.last()
+	sig, ok := fx.bus.Last()
 	if !ok {
 		t.Fatal("no signal emitted")
 	}
@@ -278,7 +187,7 @@ func TestHandleFullPath(t *testing.T) {
 
 func TestHandleStickyLeaseReuse(t *testing.T) {
 	fx := newFixture(t, func(d *Deps) {
-		d.NodeDialer.(*fakeNodeDialer).serve = func(up net.Conn) { _, _ = io.Copy(io.Discard, up); up.Close() }
+		d.NodeDialer.(*pipefake.Dialer).Serve = func(up net.Conn) { _, _ = io.Copy(io.Discard, up); up.Close() }
 	})
 	for i := 0; i < 2; i++ {
 		client, server := net.Pipe()
@@ -339,7 +248,7 @@ func TestResolveErrors(t *testing.T) {
 			if perr == nil || perr.Code != tc.code {
 				t.Fatalf("code = %v, want %s", perr, tc.code)
 			}
-			if fx.bus.count() != 0 {
+			if fx.bus.Count() != 0 {
 				t.Fatal("resolve failure must not emit a signal")
 			}
 		})
@@ -362,7 +271,7 @@ func TestResolveAuthDisabled(t *testing.T) {
 func TestResolveAccountRejected(t *testing.T) {
 	pol := identity.Policy{OnMiss: identity.OnMissReject} // empty chain → reject
 	fx := newFixture(t, func(d *Deps) {
-		d.Resolver.(*fakeResolver).policies[testPlatID] = &pol
+		d.Resolver.(*pipefake.Resolver).Policies[testPlatID] = &pol
 	})
 	req := baseReq()
 	req.RawIdentity = "Default" // no wire account, no headers → miss → reject
@@ -378,7 +287,7 @@ func TestResolveHeaderAccountWins(t *testing.T) {
 	fx := newFixture(t, nil)
 	req := baseReq()
 	req.RawIdentity = "Default.wire"
-	req.Headers = map[string]string{"x-resin-account": "hdr"}
+	req.Headers = map[string]string{"x-egress-account": "hdr"}
 	client, server := net.Pipe()
 	done := runHandle(context.Background(), fx.p, client, req)
 	_ = server.Close()
@@ -435,7 +344,7 @@ func TestDialErrors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newFixture(t, func(d *Deps) {
-				d.NodeDialer.(*fakeNodeDialer).dialErr = tc.dialErr
+				d.NodeDialer.(*pipefake.Dialer).Err = tc.dialErr
 			})
 			client, _ := net.Pipe()
 			perr := fx.p.Handle(context.Background(), client, baseReq())
@@ -443,28 +352,120 @@ func TestDialErrors(t *testing.T) {
 			if perr == nil || perr.Code != tc.code {
 				t.Fatalf("code = %v, want %s", perr, tc.code)
 			}
-			if n := fx.bus.count(); n != tc.signals {
+			if n := fx.bus.Count(); n != tc.signals {
 				t.Fatalf("signals = %d, want %d", n, tc.signals)
 			}
-			if sig, ok := fx.bus.last(); ok && sig.OK {
+			if sig, ok := fx.bus.Last(); ok && sig.OK {
 				t.Fatal("dial failure signal must have OK=false")
 			}
 		})
 	}
 }
 
+func TestRequestLogEmission(t *testing.T) {
+	collect := func(recs *[]ports.RequestLogRecord) func(ports.RequestLogRecord) {
+		return func(rec ports.RequestLogRecord) { *recs = append(*recs, rec) }
+	}
+
+	t.Run("success", func(t *testing.T) {
+		var recs []ports.RequestLogRecord
+		fx := newFixture(t, func(d *Deps) {
+			d.ReqLog = collect(&recs)
+			d.NodeDialer.(*pipefake.Dialer).Serve = func(up net.Conn) { echoUpstream(t, up, 0) }
+		})
+		client, server := net.Pipe()
+		defer server.Close()
+		done := runHandle(context.Background(), fx.p, client, baseReq())
+		_, _ = server.Write([]byte("ping"))
+		got := make([]byte, 4)
+		if _, err := io.ReadFull(server, got); err != nil {
+			t.Fatalf("read echo: %v", err)
+		}
+		_ = server.Close()
+		<-done
+		if len(recs) != 1 {
+			t.Fatalf("records = %d, want 1", len(recs))
+		}
+		r := recs[0]
+		if r.PlatformID == "" || r.Account != "alice" || r.Target != "example.com:80" {
+			t.Fatalf("record identity = %+v", r)
+		}
+		if r.NodeHash != testHash || !r.EgressIP.IsValid() {
+			t.Fatalf("record node = %+v", r)
+		}
+		if !r.NetOK || r.Stage != "" || r.EgressError != "" {
+			t.Fatalf("record outcome = %+v", r)
+		}
+		if r.BytesUp != 4 || r.BytesDown != 4 {
+			t.Fatalf("record bytes = up %d down %d, want 4/4", r.BytesUp, r.BytesDown)
+		}
+	})
+
+	t.Run("auth failure", func(t *testing.T) {
+		var recs []ports.RequestLogRecord
+		fx := newFixture(t, func(d *Deps) { d.ReqLog = collect(&recs) })
+		req := baseReq()
+		req.Token = "wrong"
+		client, _ := net.Pipe()
+		perr := fx.p.Handle(context.Background(), client, req)
+		_ = client.Close()
+		if perr == nil || perr.Code != CodeAuthFailed {
+			t.Fatalf("code = %v", perr)
+		}
+		if len(recs) != 1 || recs[0].EgressError != CodeAuthFailed || recs[0].NetOK {
+			t.Fatalf("records = %+v", recs)
+		}
+		if recs[0].Account != "" || recs[0].NodeHash != (pknode.Hash{}) {
+			t.Fatalf("pre-resolve record must not carry account/node: %+v", recs[0])
+		}
+	})
+
+	t.Run("dial failure", func(t *testing.T) {
+		var recs []ports.RequestLogRecord
+		fx := newFixture(t, func(d *Deps) {
+			d.ReqLog = collect(&recs)
+			d.NodeDialer.(*pipefake.Dialer).Err = errors.New("refused")
+		})
+		client, _ := net.Pipe()
+		_ = fx.p.Handle(context.Background(), client, baseReq())
+		_ = client.Close()
+		if len(recs) != 1 || recs[0].Stage != "dial" || recs[0].EgressError != CodeUpstreamConnectFailed {
+			t.Fatalf("records = %+v", recs)
+		}
+		if recs[0].NodeHash != testHash {
+			t.Fatalf("dial failure must name the picked node: %+v", recs[0])
+		}
+	})
+
+	t.Run("client canceled produces no record", func(t *testing.T) {
+		var recs []ports.RequestLogRecord
+		fx := newFixture(t, func(d *Deps) {
+			d.ReqLog = collect(&recs)
+			d.NodeDialer = &pipefake.Dialer{Err: context.Canceled}
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		client, _ := net.Pipe()
+		_ = fx.p.Handle(ctx, client, baseReq())
+		_ = client.Close()
+		if len(recs) != 0 {
+			t.Fatalf("records = %+v, want none", recs)
+		}
+	})
+}
+
 func TestDialClientCanceled(t *testing.T) {
 	fx := newFixture(t, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	fx.p.d.NodeDialer = &fakeNodeDialer{dialErr: context.Canceled}
+	fx.p.d.NodeDialer = &pipefake.Dialer{Err: context.Canceled}
 	client, _ := net.Pipe()
 	perr := fx.p.Handle(ctx, client, baseReq())
 	_ = client.Close()
 	if perr == nil || perr.Code != CodeClientCanceled {
 		t.Fatalf("code = %v, want %s", perr, CodeClientCanceled)
 	}
-	if n := fx.bus.count(); n != 0 {
+	if n := fx.bus.Count(); n != 0 {
 		t.Fatalf("client cancel must not emit a signal, got %d", n)
 	}
 }
@@ -472,7 +473,7 @@ func TestDialClientCanceled(t *testing.T) {
 func TestBypassDirect(t *testing.T) {
 	fx := newFixture(t, func(d *Deps) {
 		d.Bypass = func(target string) bool { return target == "example.com:80" }
-		d.Direct.(*fakeDirect).serve = func(up net.Conn) { _, _ = io.Copy(io.Discard, up); up.Close() }
+		d.Direct.(*pipefake.Direct).Serve = func(up net.Conn) { _, _ = io.Copy(io.Discard, up); up.Close() }
 	})
 	client, server := net.Pipe()
 	done := runHandle(context.Background(), fx.p, client, baseReq())
@@ -481,13 +482,13 @@ func TestBypassDirect(t *testing.T) {
 	if perr := <-done; perr != nil {
 		t.Fatalf("Handle = %v", perr)
 	}
-	if len(fx.direct.targets) != 1 || fx.direct.targets[0] != "example.com:80" {
-		t.Fatalf("direct targets = %v", fx.direct.targets)
+	if len(fx.direct.Targets) != 1 || fx.direct.Targets[0] != "example.com:80" {
+		t.Fatalf("direct targets = %v", fx.direct.Targets)
 	}
-	if len(fx.dialer.dialed()) != 0 {
+	if len(fx.dialer.DialedHashes()) != 0 {
 		t.Fatal("node dialer must not be used for bypass")
 	}
-	sig, _ := fx.bus.last()
+	sig, _ := fx.bus.Last()
 	if sig.NodeHash != (pknode.Hash{}) {
 		t.Fatalf("bypass signal node hash = %v, want zero", sig.NodeHash)
 	}
@@ -507,7 +508,7 @@ func TestBreakerExempt(t *testing.T) {
 	if perr := <-done; perr != nil {
 		t.Fatalf("Handle = %v", perr)
 	}
-	sig, _ := fx.bus.last()
+	sig, _ := fx.bus.Last()
 	if !sig.BreakerExempt {
 		t.Fatal("BreakerExempt should be true when passive breaker is off")
 	}
@@ -553,4 +554,99 @@ func TestProxyErrorString(t *testing.T) {
 	if e.Error() == "" {
 		t.Fatal("empty Error()")
 	}
+}
+
+// --- ext.Selector path (spec/ext-abi.md §2, RFC-0002) ---
+
+type recordingSelector struct{}
+
+func (recordingSelector) Name() string { return "test-recording-selector" }
+func (recordingSelector) Pick(cands []pknode.NodeSnapshot, _ ext.SelectContext) pknode.Hash {
+	for _, c := range cands {
+		if c.Hash == testHash {
+			return c.Hash
+		}
+	}
+	return pknode.Zero
+}
+
+func TestSelectViaExt_DelegatesPick(t *testing.T) {
+	ext.RegisterSelector(recordingSelector{})
+	fx := newFixture(t, func(d *Deps) {
+		d.PickPolicyFor = func(string) pick.Policy {
+			return pick.Policy{SelectorName: "test-recording-selector"}
+		}
+	})
+	prep, perr := fx.p.Prepare(context.Background(), baseReq())
+	if perr != nil {
+		t.Fatalf("Prepare: %v", perr)
+	}
+	if prep.NodeHash != testHash {
+		t.Fatalf("node = %v, want selector-picked %v", prep.NodeHash, testHash)
+	}
+	_ = prep.Upstream.Close()
+}
+
+func TestSelectViaExt_UnregisteredFailsClosed(t *testing.T) {
+	fx := newFixture(t, func(d *Deps) {
+		d.PickPolicyFor = func(string) pick.Policy {
+			return pick.Policy{SelectorName: "never-registered"}
+		}
+	})
+	_, perr := fx.p.Prepare(context.Background(), baseReq())
+	if perr == nil || perr.Code != CodeNoAvailableNodes {
+		t.Fatalf("perr = %v, want NO_AVAILABLE_NODES (fail-closed)", perr)
+	}
+}
+
+type rogueSelector struct{}
+
+func (rogueSelector) Name() string { return "test-rogue-selector" }
+func (rogueSelector) Pick(cands []pknode.NodeSnapshot, _ ext.SelectContext) pknode.Hash {
+	return pknode.Hash{0xDE, 0xAD} // not in the view: a selector bug
+}
+
+func TestSelectViaExt_OutOfViewPickRejected(t *testing.T) {
+	ext.RegisterSelector(rogueSelector{})
+	fx := newFixture(t, func(d *Deps) {
+		d.PickPolicyFor = func(string) pick.Policy {
+			return pick.Policy{SelectorName: "test-rogue-selector"}
+		}
+	})
+	_, perr := fx.p.Prepare(context.Background(), baseReq())
+	if perr == nil || perr.Code != CodeInternalError {
+		t.Fatalf("perr = %v, want INTERNAL_ERROR (out-of-view pick refused)", perr)
+	}
+}
+
+// TestRelayHeadWriteFailure covers spec/vectors/error_scenarios.yaml
+// upstream_request_failed_plain_http: the upstream dies before the
+// prepared head is written → 502 UPSTREAM_REQUEST_FAILED at the request
+// stage, with a request log entry.
+func TestRelayHeadWriteFailure(t *testing.T) {
+	var recs []ports.RequestLogRecord
+	fx := newFixture(t, func(d *Deps) {
+		d.ReqLog = func(rec ports.RequestLogRecord) { recs = append(recs, rec) }
+		d.NodeDialer.(*pipefake.Dialer).Serve = func(up net.Conn) {
+			_ = up.Close() // die before the head arrives
+		}
+	})
+	client, server := net.Pipe()
+	defer server.Close()
+
+	req := baseReq()
+	req.Head = []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	done := runHandle(context.Background(), fx.p, client, req)
+
+	// The relay writes the head to a dead upstream; Handle must report
+	// UPSTREAM_REQUEST_FAILED (the adapter maps it to 502).
+	perr := <-done
+	if perr == nil || perr.Code != CodeUpstreamRequestFailed {
+		t.Fatalf("perr = %v, want UPSTREAM_REQUEST_FAILED", perr)
+	}
+	// Request log: failure at the request stage.
+	if len(recs) != 1 || recs[0].Stage != "request" || recs[0].EgressError != CodeUpstreamRequestFailed {
+		t.Fatalf("reqlog = %+v", recs)
+	}
+	_ = client.Close()
 }

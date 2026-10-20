@@ -63,17 +63,34 @@
   → 派生 View → 载入租约重算 IPLoad → 启动 Scheduler 与 SignalBus →
   **最后**打开 listener（唯一的顺序约束）。
 
-## 目录结构（规划）
+## 目录结构
 
 ```
-cmd/egress/          组合根：装配、启停顺序（唯一的顺序约定）
+cmd/egress/          入口；装配逻辑在 boot/（供 `egress build --with` 复用）
+boot/                组合根：装配、启停顺序、build 子命令（无稳定性承诺）
 internal/core/       纯逻辑，零 I/O：identity  node(Health, step)  view  lease  select  predicate
-internal/app/        用例编排：pipeline  sync  probe  reconcile  control
-internal/ports/      Store  Dialer  Clock  Fetcher  SignalBus  Scheduler
+internal/app/        用例编排：pipeline  runtime  control  endpoint  wiring
+internal/ports/      Store  Dialer  Clock  Fetcher  SignalBus  Scheduler  RequestLogger
 internal/adapters/   sqlite  singbox  http  socks5  reverse  geoip  webui
-pkg/ext/             扩展 SDK（唯一的对外 Go API，按稳定级别分包）
+pkg/                 对外 API：node  signal  lease  ext（扩展 SDK，按稳定级别分包）
 spec/  docs/  rfcs/
 ```
+
+## 入口与扩展（落地状态）
+
+- **Endpoint 资源是运行时实体**：`internal/app/endpoint` 的 Manager 按资源声明
+  开/关/替换监听器；每个监听器首字节分流（0x05→SOCKS5，其余→HTTP），HTTP 侧
+  按能力标志路由（`/healthz` 恒在；`/api`、`/ui` 仅 allowManagement；
+  CONNECT/absolute-URI→正向；其余→反向）。能力关闭的代理流量 → 403
+  `ENDPOINT_CAPABILITY_DISABLED`；管理面关闭 → 404。环境变量定义的默认入口
+  （`default`，全能力）运行时合成、只读、不入库。
+- **扩展点全部接线**（spec/ext-abi.md，RFC-0002）：Sink←总线+RequestLog 扇出；
+  SourceProvider←syncer 未知 kind 回退；PredicateFactory←过滤属性 `ext.<factory>`；
+  AttributeProvider←6h 属性刷新循环；Prober←5min 定时全节点探测；
+  IdentityResolver←策略链 `resolver` 步；Selector←平台 `allocation: ext.<name>`。
+  所有委托点 fail-closed；未注册即报错/未命中，绝不静默回退。
+- **定制二进制**：`egress build --with <module>` 在调用方模块内生成 blank-import
+  的临时 main 并 `go build`（示例：examples/stdout-sink）。
 
 依赖方向：`core` 不 import 任何其他层；控制面只调用 `app/control`，
 不直接访问 `Store`。

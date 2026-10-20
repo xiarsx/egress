@@ -16,7 +16,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// supportedOutboundTypes is the set of outbound types that Resin manages.
+// supportedOutboundTypes is the full set of outbound types the parser
+// accepts (parse ≠ dial: the native dialer supports only a subset, see
+// dial.go ErrUnsupportedOutbound).
 var supportedOutboundTypes = map[string]bool{
 	"socks":       true,
 	"http":        true,
