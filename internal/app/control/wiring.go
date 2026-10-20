@@ -36,9 +36,21 @@ func ToPredicateFilter(f PlatformFilter) predicate.Filter { return toPredicateFi
 // during startup, before any API request is served; not safe for
 // concurrent use with in-flight requests. A nil backend leaves the
 // previous one (initially none → 501 NOT_IMPLEMENTED) in place.
+// SetEndpointHooks wires the ingress-layer endpoint change notifications
+// and status probe after construction (same assembly-cycle rationale as
+// SetHooks: the Manager needs the pipeline, which needs the resolver,
+// which needs the Service).
+func (s *Service) SetEndpointHooks(h EndpointHooks, status func(name string) (EndpointStatus, bool)) {
+	s.endpointHooks, s.endpointStatus = h, status
+}
+
+// SetRuntimeBackend splits the wired backend into its domain slices
+// (ISP): handlers see only their own interface, tests can stub a single
+// slice by assigning the field directly.
 func (s *Service) SetRuntimeBackend(b RuntimeBackend) {
 	if b == nil {
 		return
 	}
-	s.backend = b
+	s.nodeBackend, s.leaseBackend, s.viewBackend = b, b, b
+	s.sourceBackend, s.metricsBackend, s.reqLogBackend, s.geoBackend = b, b, b, b
 }

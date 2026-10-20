@@ -1,73 +1,74 @@
 # 错误场景 conformance 向量
-# 来源：设计 §15 与 ../errors.md。HTTP 入口断言 (http, x_resin_error)；
-# SOCKS5 入口断言协议回复字节。细粒度错误同时记入请求日志（resin_error / stage）。
+# 来源：设计 §15 与 ../errors.md。HTTP 入口断言 (http, x_egress_error)；
+# SOCKS5 入口断言协议回复字节。细粒度错误同时记入请求日志（egress_error / stage）。
 version: 1
 vectors:
   # --- 认证阶段（HTTP 正向） ---
   - name: forward_missing_proxy_auth
     entry: http-forward
     given: "无 Proxy-Authorization 头"
-    expect: { http: 407, x_resin_error: AUTH_REQUIRED, header: 'Proxy-Authenticate: Basic realm="Resin"' }
+    expect: { http: 407, x_egress_error: AUTH_REQUIRED, header: 'Proxy-Authenticate: Basic realm="egress"' }
   - name: forward_wrong_token
     entry: http-forward
     given: "Proxy-Authorization: Basic bWlzdG9rOmJhZC10b2tlbg==（Token 不匹配）"
-    expect: { http: 403, x_resin_error: AUTH_FAILED }
+    expect: { http: 403, x_egress_error: AUTH_FAILED }
   # --- 反向代理：认证与路径解析 ---
   - name: reverse_empty_path
     entry: reverse
     given: "路径为空（'/'）"
-    expect: { http: 403, x_resin_error: AUTH_FAILED }
+    expect: { http: 403, x_egress_error: AUTH_FAILED }
     note: "空路径在 Token 校验阶段即失败；参考实现 DESIGN.md 文字版曾写 URL_PARSE_ERROR，以本 spec（代码行为）为准"
   - name: reverse_wrong_token
     entry: reverse
     given: "路径首段 Token 与 EGRESS_PROXY_TOKEN 不一致"
-    expect: { http: 403, x_resin_error: AUTH_FAILED }
+    expect: { http: 403, x_egress_error: AUTH_FAILED }
   - name: reverse_path_too_short
     entry: reverse
     given: "/<token>/Nimbus.acct（缺少 protocol/host 段）"
-    expect: { http: 400, x_resin_error: URL_PARSE_ERROR }
+    expect: { http: 400, x_egress_error: URL_PARSE_ERROR }
   - name: reverse_bad_protocol
     entry: reverse
     given: "/<token>/Nimbus.acct/ftp/example.com/"
-    expect: { http: 400, x_resin_error: INVALID_PROTOCOL }
+    expect: { http: 400, x_egress_error: INVALID_PROTOCOL }
   - name: reverse_empty_host
     entry: reverse
     given: "/<token>/Nimbus.acct/https//"
-    expect: { http: 400, x_resin_error: INVALID_HOST }
+    expect: { http: 400, x_egress_error: INVALID_HOST }
   - name: reverse_bad_identity_encoding
     entry: reverse
     given: "身份段含非法百分号编码（如 %ZZ）"
-    expect: { http: 400, x_resin_error: URL_PARSE_ERROR }
+    expect: { http: 400, x_egress_error: URL_PARSE_ERROR }
+    note: "线网观测：Go HTTP 服务器在到达代理层之前就会以 400 拒绝非法转义（无 X-Egress-Error）；代理层的 URL_PARSE_ERROR 由单元测试（reverse parsePath）覆盖"
   # --- 路由阶段 ---
   - name: platform_not_found
     entry: http-forward
     given: "身份串平台名无对应 Platform"
-    expect: { http: 404, x_resin_error: PLATFORM_NOT_FOUND }
+    expect: { http: 404, x_egress_error: PLATFORM_NOT_FOUND }
   - name: account_rejected
     entry: reverse
     given: "Account 为空且 IdentityPolicy onMiss=reject"
-    expect: { http: 403, x_resin_error: ACCOUNT_REJECTED }
+    expect: { http: 403, x_egress_error: ACCOUNT_REJECTED }
   - name: no_available_nodes
     entry: http-forward
     given: "Platform 可路由集合为空"
-    expect: { http: 503, x_resin_error: NO_AVAILABLE_NODES }
+    expect: { http: 503, x_egress_error: NO_AVAILABLE_NODES }
   # --- 上游 ---
   - name: upstream_connect_failed
     entry: http-forward
     given: "CONNECT 经节点拨号被拒/不可达"
-    expect: { http: 502, x_resin_error: UPSTREAM_CONNECT_FAILED }
+    expect: { http: 502, x_egress_error: UPSTREAM_CONNECT_FAILED }
   - name: upstream_timeout
     entry: http-forward
     given: "连接上游或等待响应超时"
-    expect: { http: 504, x_resin_error: UPSTREAM_TIMEOUT }
+    expect: { http: 504, x_egress_error: UPSTREAM_TIMEOUT }
   - name: upstream_request_failed_plain_http
     entry: http-forward
     given: "非 CONNECT 请求经节点转发时读写失败"
-    expect: { http: 502, x_resin_error: UPSTREAM_REQUEST_FAILED }
+    expect: { http: 502, x_egress_error: UPSTREAM_REQUEST_FAILED }
   - name: upstream_request_failed_reverse
     entry: reverse
     given: "反向代理上游错误（ReverseProxy ErrorHandler）"
-    expect: { http: 502, x_resin_error: UPSTREAM_REQUEST_FAILED }
+    expect: { http: 502, x_egress_error: UPSTREAM_REQUEST_FAILED }
   # --- SOCKS5 协议回复 ---
   - name: socks5_no_acceptable_method
     entry: socks5
@@ -88,7 +89,7 @@ vectors:
   - name: socks5_route_failure
     entry: socks5
     given: "路由失败/无可用节点/拨号失败/超时"
-    expect: { socks_reply: "REP=0x01", log_resin_error_in: [PLATFORM_NOT_FOUND, NO_AVAILABLE_NODES, UPSTREAM_CONNECT_FAILED, UPSTREAM_TIMEOUT] }
+    expect: { socks_reply: "REP=0x01", log_egress_error_in: [PLATFORM_NOT_FOUND, NO_AVAILABLE_NODES, UPSTREAM_CONNECT_FAILED, UPSTREAM_TIMEOUT] }
   - name: socks5_success
     entry: socks5
     given: "隧道建立成功"

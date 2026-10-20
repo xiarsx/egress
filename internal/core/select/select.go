@@ -53,6 +53,10 @@ type Policy struct {
 	Allocation  Allocation
 	Authorities []string // latency authority domains for P2C comparison
 	StickyTTL   time.Duration
+	// SelectorName, when set, names a registered ext.Selector that fully
+	// owns the pick (spec/ext-abi.md §2): the built-in allocation and the
+	// sticky-lease machinery are bypassed (the selector owns stickiness).
+	SelectorName string
 }
 
 // View is the read side of a platform's routable set (hot path, lock-free).

@@ -11,9 +11,11 @@
 package source
 
 import (
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unique"
 
 	"github.com/xiarsx/egress/internal/ports"
@@ -42,6 +44,11 @@ type Registry struct {
 	// snapshots into the weak-persistence cache; the registry itself
 	// stays a pure in-memory authority.
 	OnApplySnapshot func(source string, nodes []pknode.NodeSnapshot)
+
+	// onNodeChange is the single fine-grained observer (the view
+	// deriver), fired per hash after adds/updates/removals, outside the
+	// lock. Registered via SetOnNodeChange (ports.NodeRegistry).
+	onNodeChange func(h pknode.Hash, removed bool)
 }
 
 // nodeRecord is one aggregated node: the merged snapshot plus the set of
@@ -102,10 +109,22 @@ func (r *Registry) ApplySnapshot(source string, nodes []pknode.NodeSnapshot) {
 		merged []pknode.NodeSnapshot
 		cb     func(string, []pknode.NodeSnapshot)
 	)
+	// Change events for the fine-grained observer (deriver): adds and
+	// removals, fired after unlock. Refreshes of kept nodes are covered
+	// by the payload refresh below.
+	var added, removed []pknode.Hash
 	defer func() {
 		r.mu.Unlock()
 		if cb != nil {
 			cb(source, merged)
+		}
+		if fn := r.onNodeChange; fn != nil {
+			for _, h := range added {
+				fn(h, false)
+			}
+			for _, h := range removed {
+				fn(h, true)
+			}
 		}
 	}()
 
@@ -138,11 +157,18 @@ func (r *Registry) ApplySnapshot(source string, nodes []pknode.NodeSnapshot) {
 			}
 			continue
 		}
+		if _, existed := r.nodes[h]; !existed {
+			added = append(added, h)
+		}
 		r.addRefLocked(source, h, byHash[h], newTags[h])
 	}
 	for h := range oldSet {
 		if _, kept := newSet[h]; !kept {
+			before := len(r.nodes)
 			r.releaseRefLocked(source, h)
+			if len(r.nodes) < before {
+				removed = append(removed, h)
+			}
 		}
 	}
 	rec.hashes = newHashes
@@ -182,9 +208,79 @@ func (r *Registry) SnapshotOf(source string) []pknode.NodeSnapshot {
 // HealthProjector (P4); unknown hashes are ignored.
 func (r *Registry) UpdateHealth(h pknode.Hash, health pknode.Health) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if nr, ok := r.nodes[h]; ok {
+	nr, ok := r.nodes[h]
+	if ok {
 		nr.snap.Health = health
+	}
+	r.mu.Unlock()
+	if ok {
+		r.fireNodeChange(h, false)
+	}
+}
+
+// UpdateEgressIP records the egress IP learned by an egress probe
+// (ports.NodeRegistry). Unknown hashes are ignored.
+func (r *Registry) UpdateEgressIP(h pknode.Hash, ip netip.Addr) {
+	r.mu.Lock()
+	nr, ok := r.nodes[h]
+	if ok && nr.snap.EgressIP != ip {
+		nr.snap.EgressIP = ip
+	}
+	r.mu.Unlock()
+	if ok {
+		r.fireNodeChange(h, false)
+	}
+}
+
+// UpdateLatency records a learned latency sample (ports.NodeRegistry).
+// Unknown hashes are ignored.
+func (r *Registry) UpdateLatency(h pknode.Hash, latency time.Duration) {
+	r.mu.Lock()
+	nr, ok := r.nodes[h]
+	if ok {
+		nr.snap.Latency = latency
+		nr.snap.HasLatency = true
+	}
+	r.mu.Unlock()
+	if ok {
+		r.fireNodeChange(h, false)
+	}
+}
+
+// UpdateAttrs merges learned attributes (ports.NodeRegistry). Unknown
+// hashes are ignored.
+func (r *Registry) UpdateAttrs(h pknode.Hash, attrs map[pknode.AttrKey]pknode.AttrValue) {
+	r.mu.Lock()
+	nr, ok := r.nodes[h]
+	if ok {
+		if nr.snap.Attrs == nil {
+			nr.snap.Attrs = make(map[pknode.AttrKey]pknode.AttrValue, len(attrs))
+		}
+		for k, v := range attrs {
+			nr.snap.Attrs[k] = v
+		}
+	}
+	r.mu.Unlock()
+	if ok {
+		r.fireNodeChange(h, false)
+	}
+}
+
+// SetOnNodeChange registers the single change observer
+// (ports.NodeRegistry).
+func (r *Registry) SetOnNodeChange(fn func(h pknode.Hash, removed bool)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onNodeChange = fn
+}
+
+// fireNodeChange invokes the observer outside the lock.
+func (r *Registry) fireNodeChange(h pknode.Hash, removed bool) {
+	r.mu.RLock()
+	fn := r.onNodeChange
+	r.mu.RUnlock()
+	if fn != nil {
+		fn(h, removed)
 	}
 }
 
@@ -224,6 +320,14 @@ func (r *Registry) addRefLocked(source string, h pknode.Hash, incoming pknode.No
 			Tags:        tags,
 			Attrs:       make(map[pknode.AttrKey]pknode.AttrValue),
 			Health:      pknode.ProbingHealth(),
+		}
+		// Cache-replayed snapshots arrive warm (egress IP, attrs, latency);
+		// keep them. Source publishes carry zeros and change nothing.
+		snap.EgressIP = incoming.EgressIP
+		snap.HasLatency = incoming.HasLatency
+		snap.Latency = incoming.Latency
+		for k, v := range incoming.Attrs {
+			snap.Attrs[k] = v
 		}
 		r.nodes[h] = &nodeRecord{snap: snap, refs: map[string]struct{}{source: {}}}
 		return

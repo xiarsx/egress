@@ -66,14 +66,14 @@ func TestReqLogAppendAndRotate(t *testing.T) {
 			var e struct {
 				ts, proxyType, platform, account, target, node, egressIP string
 				netOK, httpStatus                                        int
-				stage, resinErr                                          string
+				stage, egressErr                                         string
 				durationMs, bytesUp, bytesDown                           int64
 			}
 			if err := db.QueryRow(`SELECT ts_ns, proxy_type, platform, account, target, node,
-				egress_ip, net_ok, http_status, stage, resin_error,
+				egress_ip, net_ok, http_status, stage, egress_error,
 				duration_ms, bytes_up, bytes_down FROM request_logs LIMIT 1`).Scan(
 				&e.ts, &e.proxyType, &e.platform, &e.account, &e.target, &e.node,
-				&e.egressIP, &e.netOK, &e.httpStatus, &e.stage, &e.resinErr,
+				&e.egressIP, &e.netOK, &e.httpStatus, &e.stage, &e.egressErr,
 				&e.durationMs, &e.bytesUp, &e.bytesDown); err != nil {
 				db.Close()
 				t.Fatalf("scan: %v", err)

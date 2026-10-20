@@ -2,6 +2,7 @@ import * as countries from "i18n-iso-countries";
 import enLocale from "i18n-iso-countries/langs/en.json";
 import zhLocale from "i18n-iso-countries/langs/zh.json";
 import { getCurrentLocale, isEnglishLocale } from "../../i18n/locale";
+import type { AppLocale } from "../../i18n/locale";
 
 countries.registerLocale(enLocale);
 countries.registerLocale(zhLocale);
@@ -11,12 +12,13 @@ export interface RegionOption {
     name: string;
 }
 
-function getCountryLocale(): "zh" | "en" {
-    return isEnglishLocale(getCurrentLocale()) ? "en" : "zh";
+function getCountryLocale(locale?: AppLocale): "zh" | "en" {
+    return isEnglishLocale(locale ?? getCurrentLocale()) ? "en" : "zh";
 }
 
-export const getAllRegions = (): RegionOption[] => {
-    const names = countries.getNames(getCountryLocale(), { select: "official" });
+// locale 显式传参：调用点若在 useMemo 中缓存结果，依赖对 eslint 可见。
+export const getAllRegions = (locale: AppLocale): RegionOption[] => {
+    const names = countries.getNames(getCountryLocale(locale), { select: "official" });
     return Object.entries(names).map(([code, name]) => ({
         code,
         name: `${code} (${name})`,

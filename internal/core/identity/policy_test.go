@@ -1,15 +1,19 @@
 package identity
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/xiarsx/egress/pkg/ext"
+)
 
 func TestPolicy_FirstNonEmptyWins(t *testing.T) {
 	p := Policy{
-		Chain:  []Step{HeaderStep("X-Resin-Account"), WireStep()},
+		Chain:  []Step{HeaderStep("X-Egress-Account"), WireStep()},
 		OnMiss: OnMissRandom,
 	}
 	m := Meta{
 		IsHTTP:      true,
-		Headers:     map[string]string{"X-Resin-Account": "hdr-acct"},
+		Headers:     map[string]string{"X-Egress-Account": "hdr-acct"},
 		WireAccount: "wire-acct",
 	}
 	if acct, ok := p.Resolve(m); !ok || acct != "hdr-acct" {
@@ -24,8 +28,8 @@ func TestPolicy_FirstNonEmptyWins(t *testing.T) {
 }
 
 func TestPolicy_HeaderCaseInsensitive(t *testing.T) {
-	p := Policy{Chain: []Step{HeaderStep("X-Resin-Account")}, OnMiss: OnMissRandom}
-	m := Meta{IsHTTP: true, Headers: map[string]string{"x-resin-account": "acct"}}
+	p := Policy{Chain: []Step{HeaderStep("X-Egress-Account")}, OnMiss: OnMissRandom}
+	m := Meta{IsHTTP: true, Headers: map[string]string{"x-egress-account": "acct"}}
 	if acct, ok := p.Resolve(m); !ok || acct != "acct" {
 		t.Fatalf("Resolve = (%q, %v), want (acct, true)", acct, ok)
 	}
@@ -33,10 +37,10 @@ func TestPolicy_HeaderCaseInsensitive(t *testing.T) {
 
 func TestPolicy_HeaderSkippedOnSocks5(t *testing.T) {
 	// Header-reading steps only apply to HTTP-class ingress.
-	p := Policy{Chain: []Step{HeaderStep("X-Resin-Account"), WireStep()}, OnMiss: OnMissRandom}
+	p := Policy{Chain: []Step{HeaderStep("X-Egress-Account"), WireStep()}, OnMiss: OnMissRandom}
 	m := Meta{
 		IsHTTP:      false, // SOCKS5
-		Headers:     map[string]string{"X-Resin-Account": "hdr-acct"},
+		Headers:     map[string]string{"X-Egress-Account": "hdr-acct"},
 		WireAccount: "wire-acct",
 	}
 	if acct, ok := p.Resolve(m); !ok || acct != "wire-acct" {
@@ -109,8 +113,8 @@ func TestPolicy_OnMiss(t *testing.T) {
 
 func TestDefaultPolicy(t *testing.T) {
 	p := DefaultPolicy()
-	// Spec §5: X-Resin-Account header outranks the wire account.
-	m := Meta{IsHTTP: true, Headers: map[string]string{"X-Resin-Account": "h"}, WireAccount: "w"}
+	// Spec §5: X-Egress-Account header outranks the wire account.
+	m := Meta{IsHTTP: true, Headers: map[string]string{"X-Egress-Account": "h"}, WireAccount: "w"}
 	if acct, ok := p.Resolve(m); !ok || acct != "h" {
 		t.Fatalf("DefaultPolicy Resolve = (%q, %v), want (h, true)", acct, ok)
 	}
@@ -122,5 +126,73 @@ func TestDefaultPolicy(t *testing.T) {
 	m.WireAccount = ""
 	if acct, ok := p.Resolve(m); !ok || acct != "" {
 		t.Fatalf("DefaultPolicy Resolve = (%q, %v), want (\"\", true)", acct, ok)
+	}
+}
+
+// --- ext.IdentityResolver step (spec/ext-abi.md §2, RFC-0002) ---
+
+type stubResolver struct {
+	account string
+	handled bool
+	seen    *ext.RequestMeta
+}
+
+func (s stubResolver) Name() string { return "test-stub-resolver" }
+func (s stubResolver) Resolve(m ext.RequestMeta) (string, bool) {
+	if s.seen != nil {
+		*s.seen = m
+	}
+	return s.account, s.handled
+}
+
+func TestPolicy_ResolverStep(t *testing.T) {
+	var seen ext.RequestMeta
+	ext.RegisterIdentityResolver(stubResolver{account: "ext-account", handled: true, seen: &seen})
+
+	p := Policy{Chain: []Step{ResolverStep("test-stub-resolver")}, OnMiss: OnMissReject}
+	account, ok := p.Resolve(Meta{
+		Headers:     map[string]string{"x": "y"},
+		Target:      "example.com:443",
+		WireAccount: "wire-acct",
+		IsHTTP:      true,
+	})
+	if !ok || account != "ext-account" {
+		t.Fatalf("Resolve = (%q, %v), want (ext-account, true)", account, ok)
+	}
+	// The resolver sees the request metadata (no body, no I/O).
+	if seen.Target != "example.com:443" || seen.WireAccount != "wire-acct" || !seen.IsHTTP {
+		t.Fatalf("resolver meta = %+v", seen)
+	}
+}
+
+func TestPolicy_ResolverStepUnregisteredFallsThrough(t *testing.T) {
+	// Unregistered name resolves to "" and the chain continues (fail-closed
+	// via OnMiss), never a panic.
+	p := Policy{
+		Chain:  []Step{ResolverStep("never-registered"), WireStep()},
+		OnMiss: OnMissRandom,
+	}
+	account, ok := p.Resolve(Meta{WireAccount: "wire-acct"})
+	if !ok || account != "wire-acct" {
+		t.Fatalf("Resolve = (%q, %v), want (wire-acct, true)", account, ok)
+	}
+}
+
+type passthroughResolver struct{}
+
+func (passthroughResolver) Name() string { return "test-passthrough-resolver" }
+func (passthroughResolver) Resolve(ext.RequestMeta) (string, bool) {
+	return "", false
+}
+
+func TestPolicy_ResolverStepNotHandledContinuesChain(t *testing.T) {
+	ext.RegisterIdentityResolver(passthroughResolver{})
+	p := Policy{
+		Chain:  []Step{ResolverStep("test-passthrough-resolver"), WireStep()},
+		OnMiss: OnMissRandom,
+	}
+	account, ok := p.Resolve(Meta{WireAccount: "wire-acct"})
+	if !ok || account != "wire-acct" {
+		t.Fatalf("Resolve = (%q, %v), want (wire-acct, true)", account, ok)
 	}
 }

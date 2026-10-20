@@ -18,7 +18,7 @@ export function CountryMultiSelect({ id, value, onChange, invalid, disabled }: C
   const { locale, t } = useI18n();
   const [keyword, setKeyword] = useState("");
 
-  const regions = useMemo(() => getAllRegions(), [locale]);
+  const regions = useMemo(() => getAllRegions(locale), [locale]);
   const selected = useMemo(() => new Set(value.map((code) => code.toUpperCase())), [value]);
 
   const visibleRegions = useMemo(() => {

@@ -1,6 +1,10 @@
 package identity
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/xiarsx/egress/pkg/ext"
+)
 
 // OnMiss decides what happens when no chain step yields an account.
 type OnMiss int
@@ -22,6 +26,10 @@ const (
 	StepWire
 	// StepHeaderRule resolves via longest-prefix header rules.
 	StepHeaderRule
+	// StepResolver delegates to a registered ext.IdentityResolver
+	// (spec/ext-abi.md §2). An unregistered name resolves to ""
+	// (the chain continues; fail-closed via OnMiss).
+	StepResolver
 )
 
 // HeaderRule maps a target-URL prefix to candidate account headers.
@@ -39,6 +47,8 @@ type Step struct {
 	Header string
 	// Rules for StepHeaderRule; longest matching prefix wins.
 	Rules []HeaderRule
+	// Resolver names the ext.IdentityResolver for StepResolver.
+	Resolver string
 }
 
 // HeaderStep resolves the account from a single request header
@@ -53,6 +63,10 @@ func WireStep() Step { return Step{Kind: StepWire} }
 // (HTTP-class ingress only).
 func HeaderRuleStep(rules []HeaderRule) Step { return Step{Kind: StepHeaderRule, Rules: rules} }
 
+// ResolverStep delegates resolution to the registered ext.IdentityResolver
+// named name.
+func ResolverStep(name string) Step { return Step{Kind: StepResolver, Resolver: name} }
+
 // Policy is the ordered resolution chain: the first non-empty result wins
 // (design §4.2). OnMiss applies when every step yields "".
 type Policy struct {
@@ -61,13 +75,13 @@ type Policy struct {
 }
 
 // DefaultPolicy is the built-in chain (spec/identity.md §5):
-// X-Resin-Account header, then the wire account, then random on miss.
+// X-Egress-Account header, then the wire account, then random on miss.
 // NOTE: header steps only apply to HTTP-class ingress; on SOCKS5 they
 // are skipped automatically.
 func DefaultPolicy() Policy {
 	return Policy{
 		Chain: []Step{
-			HeaderStep("X-Resin-Account"),
+			HeaderStep("X-Egress-Account"),
 			WireStep(),
 		},
 		OnMiss: OnMissRandom,
@@ -123,6 +137,21 @@ func (s Step) resolve(m Meta) string {
 			}
 		}
 		return ""
+	case StepResolver:
+		r, ok := ext.GetIdentityResolver(s.Resolver)
+		if !ok {
+			return ""
+		}
+		account, handled := r.Resolve(ext.RequestMeta{
+			Target:      m.Target,
+			Headers:     m.Headers,
+			WireAccount: m.WireAccount,
+			IsHTTP:      m.IsHTTP,
+		})
+		if !handled {
+			return ""
+		}
+		return account
 	default:
 		return ""
 	}

@@ -29,21 +29,21 @@
 ```bash
 export EGRESS_ADMIN_TOKEN=<redacted>      # 控制面管理令牌
 export EGRESS_PROXY_TOKEN=<redacted>    # 代理认证令牌
-./egress serve
+./egress
 ```
 
 **第 2 步：填订阅**
 
-打开 WebUI（默认 `http://127.0.0.1:8080`），或调用 API 添加一个节点来源：
+打开 WebUI（默认 `http://127.0.0.1:2260/ui/`），或调用 API 添加一个节点来源：
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/v1/sources \
+curl -X POST http://127.0.0.1:2260/api/v1/sources \
   -H "Authorization: Bearer <redacted>" \
   -H "Content-Type: application/json" \
   -d '{"name":"main","type":"remote","url":"https://example.com/sub.txt"}'
 ```
 
-然后把客户端的代理指向 `127.0.0.1:8080`，用身份
+然后把客户端的代理指向 `127.0.0.1:2260`，用身份
 `Default.你的账号:proxy-secret`（HTTP Basic 用户名 / SOCKS5 用户名）
 即可开始使用。
 
@@ -52,7 +52,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/sources \
 | 文档 | 内容 |
 |---|---|
 | [spec/identity.md](./spec/identity.md) | 身份线协议 V1：三入口的身份位置、Token 规则与切分算法 |
-| [spec/errors.md](./spec/errors.md) | `X-Resin-Error` 枚举与 HTTP / SOCKS5 映射 |
+| [spec/errors.md](./spec/errors.md) | `X-Egress-Error` 枚举与 HTTP / SOCKS5 映射 |
 | [spec/resources/](./spec/resources/) | Platform / Source / Endpoint / IdentityPolicy / Recipe 的 YAML schema |
 | [spec/events.md](./spec/events.md) | Signal / RequestLog 事件 schema |
 | [spec/openapi.yaml](./spec/openapi.yaml) | 控制面 API（spec-first：先改 spec，再生成代码） |
@@ -64,11 +64,9 @@ curl -X POST http://127.0.0.1:8080/api/v1/sources \
 
 ## 兼容性说明
 
-- 线协议层面保持与 Resin 兼容：身份线协议 V1、错误码、`X-Resin-*` 响应头、
-  API 路径（`/api/v1/...`）不变。
-- 已更名的部分：环境变量前缀为 `EGRESS_`（如 `EGRESS_ADMIN_TOKEN`、
-  `EGRESS_PROXY_TOKEN`）；声明式资源文件的 `apiVersion` 为 `egress/v1`；
-  二进制名为 `egress`；订阅资源在 API 中称 `Source`（路径 `/api/v1/sources`）。
+egress 早期参考 Resin 的线协议设计，**现已独立演进，不保持兼容**：
+响应头为 `X-Egress-*`，默认身份头为 `X-Egress-Account`，环境变量仅有
+`EGRESS_*` 前缀，默认数据目录为 `/var/{lib,cache,log}/egress`。
 
 ## 构建与运行
 
@@ -94,18 +92,31 @@ export EGRESS_PROXY_TOKEN=<你的代理 token>   # 可为空字符串（空 = �
 
 - 声明式文件：`EGRESS_CONFIG=/path/to/egress.yaml ./egress`（示例见
   [egress.yaml.example](./egress.yaml.example)）
-- 或调 API：`curl -X POST http://127.0.0.1:2262/api/v1/sources \
+- 或调 API：`curl -X POST http://127.0.0.1:2260/api/v1/sources \
   -H "Authorization: Bearer <EGRESS_ADMIN_TOKEN>" -d '{...}'`
 
 `Default` 平台、默认身份链永远存在，开箱即用。
+
+### 测试
+
+```bash
+go test ./...                                # 白盒（单元 + 规范向量执行器）
+go test -tags "with_quic with_utls" ./...    # 官方 tag 配置同上
+go test -tags e2e ./e2e                      # 黑盒端到端（拉起真二进制，约 20s）
+```
+
+黑盒套件（e2e/）以子进程运行真实二进制，经线网驱动 HTTP forward / SOCKS5 /
+管理 API，断言订阅同步→探测→可路由→转发→请求日志落盘→重启重放全链路；对端
+（echo、vmess 入站）均为本地回环，无需外网。
 
 ### 端口
 
 | 端口 | 服务 | 环境变量 |
 |---|---|---|
-| 2260 | HTTP 正向代理 | `EGRESS_PORT` |
-| 2261 | SOCKS5 | `EGRESS_SOCKS_LISTEN`（默认同主机 :2261，设空禁用） |
-| 2262 | 控制面 API + 反向代理（WebUI 就绪后挂 `/ui/`） | `EGRESS_API_LISTEN`（默认同主机 :2262，设空禁用） |
+| 2260 | 默认入口：HTTP 正向代理 + SOCKS5（首字节分流）+ 反向代理 + 控制面 API + WebUI `/ui/` | `EGRESS_PORT` |
+
+默认入口由环境变量定义，运行时合成、只读、不出现在存储中；额外入口（独立端口、能力受限）用
+Endpoint 资源声明（`POST /api/v1/endpoints`，能力标志见 spec/resources/endpoint.md）。
 
 全部环境变量见 [.env.example](./.env.example)。
 
@@ -114,7 +125,7 @@ export EGRESS_PROXY_TOKEN=<你的代理 token>   # 可为空字符串（空 = �
 ```bash
 docker build -t egress .
 docker run -d --name egress \
-  -p 2260:2260 -p 2261:2261 -p 2262:2262 \
+  -p 2260:2260 \
   -e EGRESS_ADMIN_TOKEN=<admin> -e EGRESS_PROXY_TOKEN=<proxy> \
   -v egress-state:/var/lib/egress -v egress-cache:/var/cache/egress \
   -v egress-logs:/var/log/egress \

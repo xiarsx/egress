@@ -13,6 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/vmess"
+	N "github.com/sagernet/sing/common/network"
 	pknode "github.com/xiarsx/egress/pkg/node"
 )
 
@@ -295,13 +299,69 @@ func TestDialer_NoOutboundFailClosed(t *testing.T) {
 }
 
 func TestDialer_UnsupportedOutbound(t *testing.T) {
-	for _, typ := range []string{"vmess", "vless", "trojan", "shadowsocks", "hysteria2", "wireguard"} {
+	// Truly unknown / tag-gated types always fail closed; hysteria2 joins
+	// them only in binaries built without `-tags with_quic`.
+	types := []string{"foobar", "doesnotexist"}
+	if !quicCompiled {
+		types = append(types, "hysteria2")
+	}
+	for _, typ := range types {
 		h, snap := nodeWithRaw(`{"type":"` + typ + `","server":"example.com","server_port":443}`)
 		d := NewDialer(testLookup(map[pknode.Hash]pknode.NodeSnapshot{h: snap}))
 		_, err := d.DialContext(context.Background(), h, "tcp", "example.com:443")
 		if !errors.Is(err, ErrUnsupportedOutbound) {
 			t.Fatalf("type %s: err = %v, want ErrUnsupportedOutbound", typ, err)
 		}
+	}
+}
+
+// TestBuild_SupportedProtocols proves the embedded engine constructs
+// every protocol the parser can emit (dialing needs live servers and is
+// covered for http/socks/direct above).
+func TestBuild_SupportedProtocols(t *testing.T) {
+	valid := map[string]string{
+		"direct":      `{"type":"direct"}`,
+		"vmess":       `{"type":"vmess","server":"example.com","server_port":443,"uuid":"26a1d547-b031-4139-9fc5-6671e1d0408a","security":"auto"}`,
+		"vmess_tls":   `{"type":"vmess","server":"example.com","server_port":443,"uuid":"26a1d547-b031-4139-9fc5-6671e1d0408a","tls":{"enabled":true,"server_name":"example.com"}}`,
+		"vmess_ws":    `{"type":"vmess","server":"example.com","server_port":443,"uuid":"26a1d547-b031-4139-9fc5-6671e1d0408a","transport":{"type":"ws","path":"/ws"}}`,
+		"vless":       `{"type":"vless","server":"example.com","server_port":443,"uuid":"26a1d547-b031-4139-9fc5-6671e1d0408a"}`,
+		"shadowsocks": `{"type":"shadowsocks","server":"example.com","server_port":8388,"method":"aes-128-gcm","password":"pw"}`,
+		"ss_2022":     `{"type":"shadowsocks","server":"example.com","server_port":8388,"method":"2022-blake3-aes-128-gcm","password":"qJcbEOKTV+0nAOUpaVEGeQ=="}`,
+		"trojan":      `{"type":"trojan","server":"example.com","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"example.com"}}`,
+		"socks":       `{"type":"socks","server":"example.com","server_port":1080,"version":"5"}`,
+		"http":        `{"type":"http","server":"example.com","server_port":8080}`,
+	}
+	for name, raw := range valid {
+		t.Run(name, func(t *testing.T) {
+			ob, err := buildDialOutbound([]byte(raw))
+			if err != nil {
+				t.Fatalf("build %s: %v", name, err)
+			}
+			_ = ob.Close()
+		})
+	}
+
+	tagged := map[string]struct {
+		ok  bool
+		raw string
+	}{
+		"vless_reality": {utlsCompiled, `{"type":"vless","server":"example.com","server_port":443,"uuid":"26a1d547-b031-4139-9fc5-6671e1d0408a","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0","short_id":"0123456789abcdef"}}}`},
+		"hysteria2":     {quicCompiled, `{"type":"hysteria2","server":"example.com","server_port":443,"password":"pw","tls":{"enabled":true,"server_name":"example.com"}}`},
+	}
+	for name, tc := range tagged {
+		t.Run(name, func(t *testing.T) {
+			ob, err := buildDialOutbound([]byte(tc.raw))
+			if !tc.ok {
+				if !errors.Is(err, ErrUnsupportedOutbound) {
+					t.Fatalf("without tag: err = %v, want ErrUnsupportedOutbound", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("build %s: %v", name, err)
+			}
+			_ = ob.Close()
+		})
 	}
 }
 
@@ -339,7 +399,7 @@ func TestDialer_Socks5hRemoteResolve(t *testing.T) {
 	echo := startEchoServer(t)
 	proxy, requested := startSocks5Server(t, "", "")
 	host, port, _ := net.SplitHostPort(proxy)
-	raw := `{"type":"socks5h","server":"` + host + `","server_port":` + port + `}`
+	raw := `{"type":"socks","server":"` + host + `","server_port":` + port + `,"version":"5"}`
 	h, snap := nodeWithRaw(raw)
 	d := NewDialer(testLookup(map[pknode.Hash]pknode.NodeSnapshot{h: snap}))
 	// Use a hostname so the test exercises domain (ATYP 0x03) encoding;
@@ -442,13 +502,119 @@ func TestOutbound_DialContext(t *testing.T) {
 	defer conn.Close()
 	roundTrip(t, conn, "hello-outbound")
 
-	// Unsupported type through the interface.
-	obs, err = ParseSubscription([]byte(
-		`{"outbounds":[{"type":"vmess","tag":"v","server":"example.com","server_port":443,"uuid":"26a1d547-b031-4139-9fc5-6671e1d0408a"}]}`))
+	// Unsupported type through the interface still fails closed. With
+	// with_quic the supported set is broad, so this case only exists in
+	// tag-less builds (hysteria2 parses but the engine rejects it).
+	if !quicCompiled {
+		obs, err = ParseSubscription([]byte(
+			`{"outbounds":[{"type":"hysteria2","tag":"h","server":"example.com","server_port":443,"password":"pw"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := obs[0].DialContext(context.Background(), "tcp", "example.com:443"); !errors.Is(err, ErrUnsupportedOutbound) {
+			t.Fatalf("err = %v, want ErrUnsupportedOutbound", err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// full vmess round trip: engine outbound ↔ sing-box inbound ↔ echo
+// ---------------------------------------------------------------------------
+
+// echoRouter is the minimal adapter.Router a vmess inbound needs: every
+// connection is echoed back (plaintext after vmess decryption).
+type echoRouter struct{}
+
+func (echoRouter) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (echoRouter) PreMatch(adapter.InboundContext, []byte) adapter.PreMatchResult {
+	return adapter.PreMatchResult{Action: adapter.PreMatchContinue}
+}
+func (echoRouter) HijackDNSPacket(context.Context, []byte, N.PacketWriter, adapter.InboundContext) {
+}
+func (echoRouter) NeedFindProcess() bool                      { return false }
+func (echoRouter) NeedFindNeighbor() bool                     { return false }
+func (echoRouter) NeighborResolver() adapter.NeighborResolver { return nil }
+func (echoRouter) Rules() []adapter.Rule                      { return nil }
+func (echoRouter) RuleSet(string) (adapter.RuleSet, bool)     { return nil, false }
+func (echoRouter) AppendTracker(adapter.ConnectionTracker)    {}
+func (echoRouter) ResetNetwork()                              {}
+
+func (echoRouter) RouteConnection(_ context.Context, conn net.Conn, _ adapter.InboundContext) error {
+	_, _ = io.Copy(conn, conn)
+	return nil
+}
+
+func (echoRouter) RouteConnectionEx(_ context.Context, conn net.Conn, _ adapter.InboundContext, _ N.CloseHandlerFunc) {
+	go func() {
+		_, _ = io.Copy(conn, conn)
+		_ = conn.Close()
+	}()
+}
+
+func (echoRouter) RoutePacketConnection(context.Context, N.PacketConn, adapter.InboundContext) error {
+	return errors.New("no udp in test")
+}
+
+func (echoRouter) RoutePacketConnectionEx(context.Context, N.PacketConn, adapter.InboundContext, N.CloseHandlerFunc) {
+}
+
+// TestDial_VMessRoundTrip is the end-to-end proof that the embedded
+// engine really speaks vmess: the engine's vmess outbound completes the
+// AEAD handshake against a genuine sing-box vmess inbound and a plaintext
+// echo round trip succeeds through it.
+func TestDial_VMessRoundTrip(t *testing.T) {
+	const uuid = "26a1d547-b031-4139-9fc5-6671e1d0408a"
+
+	e, err := sharedEngine()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := obs[0].DialContext(context.Background(), "tcp", "example.com:443"); !errors.Is(err, ErrUnsupportedOutbound) {
-		t.Fatalf("err = %v, want ErrUnsupportedOutbound", err)
+	serverIB, err := vmess.NewInbound(e.baseCtx, echoRouter{}, e.logger, "in",
+		option.VMessInboundOptions{Users: []option.VMessUser{{UUID: uuid}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := serverIB.(interface {
+		NewConnection(context.Context, net.Conn, adapter.InboundContext, N.CloseHandlerFunc)
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go server.NewConnection(context.Background(), c, adapter.InboundContext{}, nil)
+		}
+	}()
+
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	raw := `{"type":"vmess","server":"` + host + `","server_port":` + port +
+		`,"uuid":"` + uuid + `","security":"aes-128-gcm"}`
+	h, snap := nodeWithRaw(raw)
+	d := NewDialer(testLookup(map[pknode.Hash]pknode.NodeSnapshot{h: snap}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := d.DialContext(ctx, h, "tcp", "example.com:443")
+	if err != nil {
+		t.Fatalf("vmess dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("ping-through-vmess")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len("ping-through-vmess"))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("vmess echo read: %v", err)
+	}
+	if string(got) != "ping-through-vmess" {
+		t.Fatalf("echo = %q", got)
 	}
 }

@@ -47,8 +47,14 @@ func (p Platform) Validate(allowReserved bool) error {
 	if time.Duration(p.StickyTTL) <= 0 {
 		return fmt.Errorf("control: platform %q: sticky_ttl must be positive", p.Name)
 	}
-	switch p.Allocation {
-	case AllocationBalanced, AllocationPreferLowLatency, AllocationPreferIdleIP:
+	switch {
+	case p.Allocation == AllocationBalanced,
+		p.Allocation == AllocationPreferLowLatency,
+		p.Allocation == AllocationPreferIdleIP:
+	case strings.HasPrefix(p.Allocation, "ext.") && len(p.Allocation) > len("ext."):
+		// ext.<selector>: a registered ext.Selector owns the pick
+		// (spec/ext-abi.md §2). Resolved at runtime; unregistered names
+		// fail closed (NO_AVAILABLE_NODES → route error).
 	default:
 		return fmt.Errorf("control: platform %q: invalid allocation %q", p.Name, p.Allocation)
 	}
@@ -107,9 +113,16 @@ func (s Source) Validate() error {
 }
 
 // Validate checks an Endpoint.
+// DefaultEndpointName is the synthesized env-defined endpoint (never
+// stored, read-only — spec/resources/endpoint.md).
+const DefaultEndpointName = "default"
+
 func (e Endpoint) Validate() error {
 	if err := validateResourceName("endpoint", e.Name); err != nil {
 		return err
+	}
+	if e.Name == DefaultEndpointName {
+		return fmt.Errorf("control: endpoint name %q is reserved (the env default endpoint)", e.Name)
 	}
 	if e.Port < 1 || e.Port > 65535 {
 		return fmt.Errorf("control: endpoint %q: invalid port %d", e.Name, e.Port)
@@ -154,8 +167,14 @@ func validatePolicyBody(chain []PolicyStep, onMiss string) error {
 				}
 			}
 		}
+		if s.Resolver != nil {
+			n++
+			if strings.TrimSpace(*s.Resolver) == "" {
+				return fmt.Errorf("control: chain[%d]: resolver must not be empty", i)
+			}
+		}
 		if n != 1 {
-			return fmt.Errorf("control: chain[%d]: exactly one of header|wire|headerRule must be set", i)
+			return fmt.Errorf("control: chain[%d]: exactly one of header|wire|headerRule|resolver must be set", i)
 		}
 	}
 	switch onMiss {
@@ -187,8 +206,11 @@ func (r Recipe) Validate() error {
 			return fmt.Errorf("control: recipe %q platform_template: sticky_ttl must be positive", r.Name)
 		}
 		if t.Allocation != "" {
-			switch t.Allocation {
-			case AllocationBalanced, AllocationPreferLowLatency, AllocationPreferIdleIP:
+			switch {
+			case t.Allocation == AllocationBalanced,
+				t.Allocation == AllocationPreferLowLatency,
+				t.Allocation == AllocationPreferIdleIP,
+				strings.HasPrefix(t.Allocation, "ext.") && len(t.Allocation) > len("ext."):
 			default:
 				return fmt.Errorf("control: recipe %q platform_template: invalid allocation %q", r.Name, t.Allocation)
 			}

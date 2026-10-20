@@ -73,17 +73,19 @@ func (p *HealthProjector) Project(sig pksignal.Signal) {
 		n.Health = next
 	}
 
-	// Coalescing cache writes; Flush is a scheduled task. The snapshot copy
-	// carries the egress IP reported by the probe so cache.db stays warm.
-	// The live registry image's EgressIP is maintained by the sync/probe
-	// layer via ApplySnapshot — the projector never writes it there.
+	// The egress IP reported by the probe lands in BOTH stores: the live
+	// registry image (views' by-IP index, sticky leases, geo enrichment)
+	// and the warm cache. The projector is the single writer.
 	if sig.Kind == pksignal.KindEgress && sig.EgressIP.IsValid() {
 		n.EgressIP = sig.EgressIP
+		p.Reg.UpdateEgressIP(h, sig.EgressIP)
 	}
 	p.Cache.UpsertNode(n)
 
 	if sig.Kind == pksignal.KindLatency && sig.HasLatency {
-		// Persist the raw sample for the TD-EWMA table (cache.db node_latency).
+		// Live image (routability needs HasLatency) + the raw sample for
+		// the TD-EWMA table (cache.db node_latency).
+		p.Reg.UpdateLatency(h, sig.Latency)
 		ms := float64(sig.Latency) / float64(time.Millisecond)
 		p.Cache.UpsertLatency(h, sig.Domain, ms, sig.At, sig.Authority)
 	}

@@ -1,6 +1,6 @@
 # 身份线协议 V1（Identity Wire Protocol V1）
 
-> 状态：**stable**。V1 线协议保持与 Resin 兼容；任何破坏性变更必须走 RFC。
+> 状态：**stable**。V1 线协议是稳定契约；任何破坏性变更必须走 RFC。
 
 身份（Identity）是 `Platform.Account` 二元组。入口只解析一次，之后全链路
 只传 `PlatformID`（UUID），不再传名字。
@@ -13,7 +13,7 @@
 | SOCKS5 | RFC1929 用户名密码认证：`username = Platform.Account`，`password = TOKEN` | 密码段 |
 | HTTP 反向 | 路径首段：`/TOKEN/Platform.Account/proto/host/path?query` | 路径第一段 |
 
-Token 规则（与 Resin 一致）：
+Token 规则：
 
 - `EGRESS_PROXY_TOKEN` 非空时始终执行令牌认证；Token 校验失败 → `AUTH_FAILED`。
 - `EGRESS_PROXY_TOKEN` 为空时：HTTP 正向允许无认证（视为 `Default` 平台请求，
@@ -80,11 +80,11 @@ function splitIdentity(identity):
 资源决定（见 [resources/identitypolicy.md](./resources/identitypolicy.md)）。
 默认链（`default`）：
 
-1. `header: X-Resin-Account`（HTTP 类入口；SOCKS5 上自动跳过）
+1. `header: X-Egress-Account`（HTTP 类入口；SOCKS5 上自动跳过）
 2. `wire: {}`（线协议中的 Account）
 3. `onMiss: random`（未命中则随机路由；`reject` → 403 `ACCOUNT_REJECTED`）
 
-优先级：`X-Resin-Account` 请求头 > URL 身份段的 Account > 请求头提取规则。
+优先级：`X-Egress-Account` 请求头 > URL 身份段的 Account > 请求头提取规则。
 
 ## 6. 例子
 
@@ -93,8 +93,8 @@ function splitIdentity(identity):
 
 | 输入 | Platform | Account |
 |---|---|---|
-| `Nimbus.Tom:resin-123456`（正向 `user:pass`） | `Nimbus` | `Tom` |
-| `.Tom:resin-123456` | 空 → `Default` | `Tom` |
-| `Nimbus:resin-123456` | `Nimbus` | 空 → 随机路由 |
-| `MyHub.bEA:234:resin-123456` | `MyHub` | `bEA:234`（Account 可含 `:`） |
-| `/resin-123456/MyHub.ops%2Fprod%3Feu%231/...`（反向） | `MyHub` | `ops/prod?eu#1`（解码后） |
+| `Nimbus.Tom:egress-123456`（正向 `user:pass`） | `Nimbus` | `Tom` |
+| `.Tom:egress-123456` | 空 → `Default` | `Tom` |
+| `Nimbus:egress-123456` | `Nimbus` | 空 → 随机路由 |
+| `MyHub.bEA:234:egress-123456` | `MyHub` | `bEA:234`（Account 可含 `:`） |
+| `/egress-123456/MyHub.ops%2Fprod%3Feu%231/...`（反向） | `MyHub` | `ops/prod?eu#1`（解码后） |

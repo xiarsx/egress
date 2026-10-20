@@ -4,11 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/xiarsx/egress/internal/app/control"
+	"github.com/xiarsx/egress/internal/testutil/memstore"
 )
 
 const testFileYAML = `apiVersion: egress/v1
@@ -17,7 +17,7 @@ metadata:
   name: default
 spec:
   chain:
-    - header: X-Resin-Account
+    - header: X-Egress-Account
     - wire: {}
     - headerRule:
         rules:
@@ -66,7 +66,7 @@ metadata:
 spec:
   identityPolicy:
     chain:
-      - header: X-Resin-Account
+      - header: X-Egress-Account
       - wire: {}
     onMiss: random
   platformTemplate:
@@ -85,7 +85,7 @@ func writeTestFile(t *testing.T, content string) string {
 
 func TestApplyFile(t *testing.T) {
 	ctx := context.Background()
-	st := newMemStore()
+	st := memstore.New()
 	if err := ApplyFile(ctx, writeTestFile(t, testFileYAML), st); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestApplyFileRejects(t *testing.T) {
 		"bad duration":   "apiVersion: egress/v1\nkind: Platform\nmetadata:\n  name: x\nspec:\n  stickyTTL: soon\n",
 		"bad enum":       "apiVersion: egress/v1\nkind: Platform\nmetadata:\n  name: x\nspec:\n  allocation: NOPE\n",
 	} {
-		st := newMemStore()
+		st := memstore.New()
 		if err := ApplyFile(ctx, writeTestFile(t, content), st); err == nil {
 			t.Fatalf("%s: expected error", name)
 		}
@@ -187,7 +187,7 @@ func TestApplyFileRejects(t *testing.T) {
 
 func TestApplyFileClearsDrift(t *testing.T) {
 	ctx := context.Background()
-	st := newMemStore()
+	st := memstore.New()
 	path := writeTestFile(t, testFileYAML)
 	if err := ApplyFile(ctx, path, st); err != nil {
 		t.Fatal(err)
@@ -224,7 +224,7 @@ func TestApplyFileClearsDrift(t *testing.T) {
 
 func TestEnsureDefaultPlatformIdempotent(t *testing.T) {
 	ctx := context.Background()
-	st := newMemStore()
+	st := memstore.New()
 	for i := 0; i < 2; i++ {
 		if err := EnsureDefaultPlatform(ctx, st); err != nil {
 			t.Fatal(err)
@@ -266,84 +266,5 @@ func TestEnsureDefaultPlatformIdempotent(t *testing.T) {
 	}
 	if pol.OnMiss != control.OnMissRandom {
 		t.Fatalf("onMiss = %q", pol.OnMiss)
-	}
-}
-
-func TestApplyLegacyDefaultEnv(t *testing.T) {
-	clearEnv(t)
-	t.Setenv("RESIN_DEFAULT_PLATFORM_STICKY_TTL", "24h")
-	t.Setenv("RESIN_DEFAULT_PLATFORM_ALLOCATION_POLICY", "PREFER_LOW_LATENCY")
-	t.Setenv("RESIN_DEFAULT_PLATFORM_PASSIVE_BREAKER", "off")
-	t.Setenv("RESIN_DEFAULT_PLATFORM_REGEX_FILTERS", "^sub-a/, !expired")
-	t.Setenv("RESIN_DEFAULT_PLATFORM_REGION_FILTERS", "hk, jp, !cn")
-	t.Setenv("RESIN_DEFAULT_PLATFORM_REVERSE_PROXY_MISS_ACTION", "REJECT")
-	t.Setenv("RESIN_DEFAULT_PLATFORM_REVERSE_PROXY_EMPTY_ACCOUNT_BEHAVIOR", "FIXED_HEADER")
-	t.Setenv("RESIN_DEFAULT_PLATFORM_REVERSE_PROXY_FIXED_ACCOUNT_HEADER", "X-Custom-Account")
-
-	ctx := context.Background()
-	st := newMemStore()
-	out := captureStderr(t, func() {
-		if err := ApplyLegacyDefaultEnv(ctx, st); err != nil {
-			t.Fatal(err)
-		}
-	})
-	if !strings.Contains(out, "[DEPRECATED]") {
-		t.Fatalf("expected deprecation warnings, got %q", out)
-	}
-
-	r, _ := st.Get(ctx, "Platform", "Default")
-	doc, _ := control.DecodeDoc(r.Data)
-	var p control.Platform
-	if err := control.DecodeSpec(doc, &p); err != nil {
-		t.Fatal(err)
-	}
-	if time.Duration(p.StickyTTL) != 24*time.Hour {
-		t.Fatalf("stickyTTL = %v", p.StickyTTL)
-	}
-	if p.Allocation != "PREFER_LOW_LATENCY" || p.PassiveBreaker != "off" {
-		t.Fatalf("platform = %+v", p)
-	}
-	if len(p.Filter.Tags) != 2 || p.Filter.Tags[0] != "^sub-a/" {
-		t.Fatalf("tags = %v", p.Filter.Tags)
-	}
-	cond := p.Filter.Attrs["geo.country"]
-	if len(cond.In) != 2 || cond.In[0] != "hk" || len(cond.NotIn) != 1 || cond.NotIn[0] != "cn" {
-		t.Fatalf("geo.country = %+v", cond)
-	}
-
-	pr, _ := st.Get(ctx, "IdentityPolicy", "default")
-	pdoc, _ := control.DecodeDoc(pr.Data)
-	var pol control.IdentityPolicy
-	if err := control.DecodeSpec(pdoc, &pol); err != nil {
-		t.Fatal(err)
-	}
-	if pol.OnMiss != control.OnMissReject {
-		t.Fatalf("onMiss = %q", pol.OnMiss)
-	}
-	// Chain: X-Resin-Account, X-Custom-Account (fixed header), wire.
-	if len(pol.Chain) != 3 {
-		t.Fatalf("chain = %+v", pol.Chain)
-	}
-	if pol.Chain[0].Header == nil || *pol.Chain[0].Header != "X-Resin-Account" {
-		t.Fatalf("chain[0] = %+v", pol.Chain[0])
-	}
-	if pol.Chain[1].Header == nil || *pol.Chain[1].Header != "X-Custom-Account" {
-		t.Fatalf("chain[1] = %+v", pol.Chain[1])
-	}
-	if pol.Chain[2].Wire == nil {
-		t.Fatalf("chain[2] = %+v", pol.Chain[2])
-	}
-}
-
-func TestApplyLegacyDefaultEnvNoop(t *testing.T) {
-	clearEnv(t)
-	ctx := context.Background()
-	st := newMemStore()
-	if err := ApplyLegacyDefaultEnv(ctx, st); err != nil {
-		t.Fatal(err)
-	}
-	// Nothing set → Default platform untouched (not even created).
-	if _, err := st.Get(ctx, "Platform", "Default"); err == nil {
-		t.Fatal("expected no Default platform when no legacy vars are set")
 	}
 }

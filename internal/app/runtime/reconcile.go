@@ -54,6 +54,9 @@ type Deps struct {
 	Breaker    node.BreakerConfig
 	// Syncer is injected by the assembly root (P2's Syncer).
 	Syncer Syncer
+	// CacheFlushInterval overrides CacheFlushInterval when > 0 (ops/test
+	// knob: crash-consistency window vs. write amplification).
+	CacheFlushInterval time.Duration
 }
 
 // Runtime is the assembled P4 runtime: reconcile-on-start plus the
@@ -94,6 +97,19 @@ func New(d Deps) *Runtime {
 		Cfg:   d.Breaker,
 		Clock: d.Clock,
 	}
+	// The registry → deriver link: every node mutation (source publish,
+	// health step, learned egress IP/attrs) re-applies that node to every
+	// platform View; removals drop it. Without this hook the views freeze
+	// at their initial full-scan and no node ever becomes routable.
+	d.Registry.SetOnNodeChange(func(h pknode.Hash, removed bool) {
+		if removed {
+			d.Deriver.Remove(h)
+			return
+		}
+		if snap, ok := d.Registry.Get(h); ok {
+			d.Deriver.Apply(snap)
+		}
+	})
 	return r
 }
 
@@ -131,11 +147,18 @@ func (r *Runtime) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("runtime: list sources: %w", err)
 	}
+	// Views and leases are keyed by platform UUID (the hot path resolves
+	// wire names to UUIDs before lookup), so reconcile must translate the
+	// store's name keys up front.
 	platformIDs := make([]string, 0, len(platPage.Items))
 	platformSet := make(map[string]bool, len(platPage.Items))
 	for _, res := range platPage.Items {
-		platformIDs = append(platformIDs, res.Name)
-		platformSet[res.Name] = true
+		spec, err := d.Platforms.GetPlatformSpec(ctx, res.Name)
+		if err != nil {
+			return fmt.Errorf("runtime: resolve platform %s: %w", res.Name, err)
+		}
+		platformIDs = append(platformIDs, spec.ID)
+		platformSet[spec.ID] = true
 	}
 
 	// --- 2. cache.db candidates ---
@@ -194,7 +217,11 @@ func (r *Runtime) Run(ctx context.Context) error {
 	sub := d.Bus.Subscribe()
 	go r.projector.Run(ctx, sub)
 
-	r.scheduleRecurring(CacheFlushInterval, func(context.Context) {
+	flushEvery := d.CacheFlushInterval
+	if flushEvery <= 0 {
+		flushEvery = CacheFlushInterval
+	}
+	r.scheduleRecurring(flushEvery, func(context.Context) {
 		_ = d.CacheStore.Flush() // best-effort; the final flush happens at shutdown
 	})
 	r.scheduleRecurring(EphemeralEvictInterval, func(context.Context) {

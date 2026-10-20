@@ -2,7 +2,6 @@ package reverse
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"io"
 	"math/rand/v2"
@@ -10,81 +9,37 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/xiarsx/egress/internal/app/pipeline"
 	"github.com/xiarsx/egress/internal/core/identity"
 	"github.com/xiarsx/egress/internal/core/lease"
 	pick "github.com/xiarsx/egress/internal/core/select"
 	"github.com/xiarsx/egress/internal/core/view"
+	"github.com/xiarsx/egress/internal/testutil/pipefake"
 	pknode "github.com/xiarsx/egress/pkg/node"
-	pksignal "github.com/xiarsx/egress/pkg/signal"
 )
-
-type fakeClock struct{ t time.Time }
-
-func (f *fakeClock) Now() time.Time { return f.t }
-
-type fakeResolver struct{ id string }
-
-func (f *fakeResolver) ResolvePlatform(name string) (string, bool) {
-	if name == "Default" {
-		return f.id, true
-	}
-	return "", false
-}
-func (f *fakeResolver) PolicyFor(string) *identity.Policy { return nil }
-
-type fakeBus struct{}
-
-func (b *fakeBus) Emit(pksignal.Signal)              {}
-func (b *fakeBus) Subscribe() <-chan pksignal.Signal { return nil }
-
-type fakeDialer struct {
-	mu    sync.Mutex
-	err   error
-	serve func(net.Conn)
-}
-
-func (f *fakeDialer) DialContext(ctx context.Context, h pknode.Hash, network, address string) (net.Conn, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	up, peer := net.Pipe()
-	go func() {
-		if f.serve != nil {
-			f.serve(peer)
-		} else {
-			_, _ = io.Copy(io.Discard, peer)
-		}
-	}()
-	return up, nil
-}
-
-type fakeDirect struct{}
-
-func (f *fakeDirect) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	return nil, errors.New("no direct")
-}
 
 var (
 	testHash   = pknode.Hash{5, 5, 5}
 	testPlatID = "test-platform-id"
 )
 
-func newPipeline(t *testing.T, token string, d *fakeDialer) *pipeline.Pipeline {
+func newPipeline(t *testing.T, token string, d *pipefake.Dialer) *pipeline.Pipeline {
 	t.Helper()
 	snap := pknode.NodeSnapshot{Hash: testHash, EgressIP: netip.MustParseAddr("198.51.100.5"), HasOutbound: true, Health: pknode.HealthyHealth(0)}
 	v := view.Derive([]pknode.NodeSnapshot{snap}, nil)
 	return pipeline.New(pipeline.Deps{
-		Resolver:   &fakeResolver{id: testPlatID},
+		Resolver:   &pipefake.Resolver{ID: testPlatID},
 		NodeDialer: d,
-		Direct:     &fakeDirect{},
-		Bus:        &fakeBus{},
-		Clock:      &fakeClock{t: time.Now()},
+		Direct:     &pipefake.Direct{},
+		Bus:        &pipefake.Bus{},
+		Clock:      &pipefake.Clock{T: time.Now()},
 		Leases:     lease.NewLeaseTable(),
 		Views:      func(string) *view.View { return v },
 		Nodes: func(h pknode.Hash) (pknode.NodeSnapshot, bool) {
@@ -93,20 +48,20 @@ func newPipeline(t *testing.T, token string, d *fakeDialer) *pipeline.Pipeline {
 			}
 			return pknode.NodeSnapshot{}, false
 		},
-		Latency:    func(pknode.Hash, string) (time.Duration, bool) { return 0, false },
-		IPLoad:     func(string, netip.Addr) int64 { return 0 },
-		PickPolicy: pick.Policy{Allocation: pick.AllocationBalanced},
-		Rand:       rand.New(rand.NewPCG(11, 11)),
-		ProxyToken: token,
+		Latency:       func(pknode.Hash, string) (time.Duration, bool) { return 0, false },
+		IPLoad:        func(string, netip.Addr) int64 { return 0 },
+		PickPolicyFor: func(string) pick.Policy { return pick.Policy{Allocation: pick.AllocationBalanced} },
+		Rand:          rand.New(rand.NewPCG(11, 11)),
+		ProxyToken:    token,
 	})
 }
 
 func TestParsePath(t *testing.T) {
-	h := New(newPipeline(t, "tok", &fakeDialer{}))
+	h := New(newPipeline(t, "tok", &pipefake.Dialer{}))
 	tests := []struct {
-		name     string
-		path     string // as r.URL.EscapedPath() would return it
-		resinErr string // "" = expect success
+		name      string
+		path      string // as r.URL.EscapedPath() would return it
+		egressErr string // "" = expect success
 	}{
 		{"empty path", "/", "AUTH_FAILED"},
 		{"empty path no slash", "", "AUTH_FAILED"},
@@ -127,7 +82,7 @@ func TestParsePath(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			pp, perr := h.parsePath(tc.path)
-			if tc.resinErr == "" {
+			if tc.egressErr == "" {
 				if perr != nil {
 					t.Fatalf("perr = %v, want success", perr)
 				}
@@ -136,15 +91,15 @@ func TestParsePath(t *testing.T) {
 				}
 				return
 			}
-			if perr == nil || perr.Code != tc.resinErr {
-				t.Fatalf("perr = %v, want %s", perr, tc.resinErr)
+			if perr == nil || perr.Code != tc.egressErr {
+				t.Fatalf("perr = %v, want %s", perr, tc.egressErr)
 			}
 		})
 	}
 }
 
 func TestParsePathIdentitySplit(t *testing.T) {
-	h := New(newPipeline(t, "tok", &fakeDialer{}))
+	h := New(newPipeline(t, "tok", &pipefake.Dialer{}))
 	// Escaped identity segment decodes before splitting (spec vector).
 	pp, perr := h.parsePath("/tok/MyHub.ops%2Fprod%3Feu%231/http/example.com/")
 	if perr != nil {
@@ -156,12 +111,12 @@ func TestParsePathIdentitySplit(t *testing.T) {
 }
 
 func TestServeHTTPErrors(t *testing.T) {
-	h := New(newPipeline(t, "tok", &fakeDialer{}))
+	h := New(newPipeline(t, "tok", &pipefake.Dialer{}))
 	tests := []struct {
-		name     string
-		path     string
-		status   int
-		resinErr string
+		name      string
+		path      string
+		status    int
+		egressErr string
 	}{
 		{"empty path", "/", 403, "AUTH_FAILED"},
 		{"short path", "/tok", 400, "URL_PARSE_ERROR"},
@@ -177,8 +132,8 @@ func TestServeHTTPErrors(t *testing.T) {
 			if rec.Code != tc.status {
 				t.Fatalf("status = %d, want %d", rec.Code, tc.status)
 			}
-			if got := rec.Header().Get("X-Resin-Error"); got != tc.resinErr {
-				t.Fatalf("X-Resin-Error = %q, want %q", got, tc.resinErr)
+			if got := rec.Header().Get("X-Egress-Error"); got != tc.egressErr {
+				t.Fatalf("X-Egress-Error = %q, want %q", got, tc.egressErr)
 			}
 			if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
 				t.Fatalf("Content-Type = %q", ct)
@@ -190,13 +145,13 @@ func TestServeHTTPErrors(t *testing.T) {
 func TestParseUppercaseProtocol(t *testing.T) {
 	// Shape-valid path with uppercase protocol: parsing must accept it;
 	// the dial stage then fails (failing dialer), proving we got past parse.
-	d := &fakeDialer{err: errors.New("connection refused")}
+	d := &pipefake.Dialer{Err: errors.New("connection refused")}
 	h := New(newPipeline(t, "tok", d))
 	req := httptest.NewRequest("GET", "/tok/Default.alice/HTTP/example.com/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 502 || rec.Header().Get("X-Resin-Error") != "UPSTREAM_CONNECT_FAILED" {
-		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("X-Resin-Error"))
+	if rec.Code != 502 || rec.Header().Get("X-Egress-Error") != "UPSTREAM_CONNECT_FAILED" {
+		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("X-Egress-Error"))
 	}
 }
 
@@ -223,7 +178,7 @@ func (l *chanListener) Addr() net.Addr {
 
 func TestReverseProxyRoundTrip(t *testing.T) {
 	headCh := make(chan []byte, 1)
-	d := &fakeDialer{serve: func(up net.Conn) {
+	d := &pipefake.Dialer{Serve: func(up net.Conn) {
 		defer up.Close()
 		br := bufio.NewReader(up)
 		var head []byte
@@ -249,7 +204,7 @@ func TestReverseProxyRoundTrip(t *testing.T) {
 	// Raw client speaking to the hijacked connection.
 	raw := "GET /tok/Default.alice/http/example.com/p?q=1 HTTP/1.1\r\n" +
 		"Host: example.com\r\n" +
-		"X-Resin-Account: bob\r\n" +
+		"X-Egress-Account: bob\r\n" +
 		"Connection: close\r\n\r\n"
 	if _, err := io.WriteString(cc, raw); err != nil {
 		t.Fatal(err)
@@ -274,8 +229,8 @@ func TestReverseProxyRoundTrip(t *testing.T) {
 		if !strings.Contains(hs, "Host: example.com\r\n") {
 			t.Fatalf("missing Host header in %q", hs)
 		}
-		if strings.Contains(strings.ToLower(hs), "x-resin-account") {
-			t.Fatalf("X-Resin-Account leaked upstream: %q", hs)
+		if strings.Contains(strings.ToLower(hs), "x-egress-account") {
+			t.Fatalf("X-Egress-Account leaked upstream: %q", hs)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("upstream never got the head")
@@ -283,22 +238,74 @@ func TestReverseProxyRoundTrip(t *testing.T) {
 }
 
 func TestReverseDialFailure(t *testing.T) {
-	d := &fakeDialer{err: errors.New("connection refused")}
+	d := &pipefake.Dialer{Err: errors.New("connection refused")}
 	h := New(newPipeline(t, "tok", d))
 	req := httptest.NewRequest("GET", "/tok/Default.alice/http/example.com/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 502 || rec.Header().Get("X-Resin-Error") != "UPSTREAM_CONNECT_FAILED" {
-		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("X-Resin-Error"))
+	if rec.Code != 502 || rec.Header().Get("X-Egress-Error") != "UPSTREAM_CONNECT_FAILED" {
+		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("X-Egress-Error"))
 	}
 }
 
 func TestReversePlatformNotFound(t *testing.T) {
-	h := New(newPipeline(t, "tok", &fakeDialer{}))
+	h := New(newPipeline(t, "tok", &pipefake.Dialer{}))
 	req := httptest.NewRequest("GET", "/tok/Nope.alice/http/example.com/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 404 || rec.Header().Get("X-Resin-Error") != "PLATFORM_NOT_FOUND" {
-		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("X-Resin-Error"))
+	if rec.Code != 404 || rec.Header().Get("X-Egress-Error") != "PLATFORM_NOT_FOUND" {
+		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("X-Egress-Error"))
+	}
+}
+
+// TestParsePath_ConformanceVectors executes the entry=reverse vectors
+// from spec/vectors/identity_vectors.yaml (the spec is the source of
+// truth; no hand-mirrored copies).
+func TestParsePath_ConformanceVectors(t *testing.T) {
+	type expect struct {
+		Token    string `yaml:"token"`
+		Platform string `yaml:"platform"`
+		Account  string `yaml:"account"`
+		Proto    string `yaml:"proto"`
+		Host     string `yaml:"host"`
+	}
+	var f struct {
+		Vectors []struct {
+			Name   string `yaml:"name"`
+			Entry  string `yaml:"entry"`
+			Path   string `yaml:"path"`
+			Expect expect `yaml:"expect"`
+		}
+	}
+	raw, err := os.ReadFile("../../../spec/vectors/identity_vectors.yaml")
+	if err != nil {
+		t.Fatalf("read vectors: %v", err)
+	}
+	if err := yaml.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse vectors: %v", err)
+	}
+
+	h := New(newPipeline(t, "egress-123456", &pipefake.Dialer{}))
+	n := 0
+	for _, v := range f.Vectors {
+		if v.Entry != "reverse" {
+			continue
+		}
+		n++
+		t.Run(v.Name, func(t *testing.T) {
+			pp, perr := h.parsePath(v.Path)
+			if perr != nil {
+				t.Fatalf("parsePath(%q): %v", v.Path, perr)
+			}
+			platform, account := identity.SplitIdentity(pp.identity)
+			if pp.token != v.Expect.Token || platform != v.Expect.Platform ||
+				account != v.Expect.Account || pp.protocol != v.Expect.Proto || pp.host != v.Expect.Host {
+				t.Fatalf("parsePath(%q) = (%q, %q, %q, %q, %q), want %+v",
+					v.Path, pp.token, platform, account, pp.protocol, pp.host, v.Expect)
+			}
+		})
+	}
+	if n == 0 {
+		t.Fatal("no reverse vectors found — spec/vectors/identity_vectors.yaml changed?")
 	}
 }

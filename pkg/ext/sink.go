@@ -18,20 +18,20 @@ const (
 // RequestLog mirrors the stable request-log schema (spec/events.md §2):
 // one record per proxied request.
 type RequestLog struct {
-	TS         int64  // unix nanos
-	ProxyType  string // "http-forward" | "reverse" | "socks5-forward"
-	Platform   string // resolved platform name (wire name, not UUID)
-	Account    string // "" = random routing
-	Target     string
-	Node       string // node hash hex, "" when unassigned
-	EgressIP   string
-	NetOK      bool
-	HTTPStatus int
-	Stage      string
-	ResinError string
-	DurationMs int64
-	BytesUp    int64
-	BytesDown  int64
+	TS          int64  // unix nanos
+	ProxyType   string // "http-forward" | "reverse" | "socks5-forward"
+	Platform    string // resolved platform name (wire name, not UUID)
+	Account     string // "" = random routing
+	Target      string
+	Node        string // node hash hex, "" when unassigned
+	EgressIP    string
+	NetOK       bool
+	HTTPStatus  int
+	Stage       string
+	EgressError string
+	DurationMs  int64
+	BytesUp     int64
+	BytesDown   int64
 }
 
 // Event is what a Sink consumes: a Signal or a RequestLog.

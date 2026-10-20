@@ -84,10 +84,12 @@ func TestTrackerAuthorityPinned(t *testing.T) {
 
 func TestEtld1(t *testing.T) {
 	cases := map[string]string{
-		"www.example.com": "example.com",
-		"EXAMPLE.COM.":    "example.com",
-		"localhost":       "localhost",
-		"a.b.c.d":         "c.d",
+		"www.example.com":   "example.com",
+		"EXAMPLE.COM.":      "example.com",
+		"localhost":         "localhost",
+		"a.b.c.d":           "c.d",
+		"www.example.co.uk": "example.co.uk", // 多级公共后缀不再错桶
+		"1.2.3.4":           "1.2.3.4",       // IP 回退原文
 	}
 	for in, want := range cases {
 		if got := etld1(in); got != want {

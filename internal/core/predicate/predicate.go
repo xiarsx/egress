@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/xiarsx/egress/pkg/ext"
 	pknode "github.com/xiarsx/egress/pkg/node"
 )
 
@@ -54,6 +55,12 @@ func LteIs(bound string) AttrCondition { return AttrCondition{Lte: bound, HasLte
 // Compile validates the filter and returns a match function.
 // A bad regex or an empty tag pattern is a Compile-time error, never a
 // hot-path failure.
+// ExtPrefix marks an attribute key as an extension filter dimension
+// (spec/ext-abi.md §2): "ext.<factory>" delegates matching to the
+// PredicateFactory registered under <factory>. An unregistered factory
+// is a Compile-time error (fail-closed on the cold path).
+const ExtPrefix = "ext."
+
 func Compile(f Filter) (pknode.Predicate, error) {
 	tf, err := compileTags(f.Tags)
 	if err != nil {
@@ -63,9 +70,73 @@ func Compile(f Filter) (pknode.Predicate, error) {
 	if err != nil {
 		return nil, err
 	}
+	xf, err := compileExt(f.Attrs)
+	if err != nil {
+		return nil, err
+	}
 	return func(n pknode.NodeSnapshot) bool {
-		return tf.match(n.Tags) && af.match(n.Attrs)
+		return tf.match(n.Tags) && af.match(n.Attrs) && xf.match(n.Attrs)
 	}, nil
+}
+
+// compileExt compiles the ext.<factory> attribute conditions. The
+// built-in operators don't apply to ext keys (the factory owns
+// semantics), so they are excluded from compileAttrs.
+func compileExt(attrs map[string]AttrCondition) (*extFilter, error) {
+	xf := &extFilter{}
+	for k, c := range attrs {
+		name, ok := strings.CutPrefix(k, ExtPrefix)
+		if !ok || name == "" {
+			continue
+		}
+		factory, found := ext.GetPredicateFactory(name)
+		if !found {
+			return nil, fmt.Errorf("predicate: no predicate factory registered for %q", k)
+		}
+		fn, err := factory.Compile(c.args())
+		if err != nil {
+			return nil, fmt.Errorf("predicate: factory %q: %w", k, err)
+		}
+		xf.preds = append(xf.preds, fn)
+	}
+	return xf, nil
+}
+
+// args maps the declarative condition fields to factory arguments.
+func (c AttrCondition) args() map[string]string {
+	args := map[string]string{}
+	if len(c.In) > 0 {
+		args["in"] = strings.Join(c.In, ",")
+	}
+	if len(c.NotIn) > 0 {
+		args["notIn"] = strings.Join(c.NotIn, ",")
+	}
+	if c.Match != "" {
+		args["match"] = c.Match
+	}
+	if c.NotMatch != "" {
+		args["notMatch"] = c.NotMatch
+	}
+	if c.HasGte {
+		args["gte"] = c.Gte
+	}
+	if c.HasLte {
+		args["lte"] = c.Lte
+	}
+	return args
+}
+
+type extFilter struct {
+	preds []func(ext.Attrs) bool
+}
+
+func (xf *extFilter) match(attrs map[pknode.AttrKey]pknode.AttrValue) bool {
+	for _, pred := range xf.preds {
+		if !pred(attrs) {
+			return false
+		}
+	}
+	return true
 }
 
 // --- tags ---
@@ -158,6 +229,9 @@ type attrFilter struct {
 func compileAttrs(attrs map[string]AttrCondition) (*attrFilter, error) {
 	af := &attrFilter{conds: make(map[pknode.AttrKey]*attrCond, len(attrs))}
 	for k, c := range attrs {
+		if strings.HasPrefix(k, ExtPrefix) {
+			continue // ext keys are compiled by compileExt
+		}
 		cc := &attrCond{
 			in:     c.In,
 			notIn:  c.NotIn,

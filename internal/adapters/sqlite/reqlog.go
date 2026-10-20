@@ -18,8 +18,7 @@ import (
 // request_logs-<seq>.db (seq zero-padded, monotonically increasing).
 const reqLogFilePrefix = "request_logs-"
 
-// Tuning for the append path (reference: RESIN_REQUEST_LOG_QUEUE_SIZE
-// 8192, batch 4096, 5m interval; interval shortened here — see below).
+// Tuning for the append path: bounded staging queue, batched flushes.
 const (
 	reqLogQueueSize  = 8192
 	reqLogBatchSize  = 4096
@@ -34,20 +33,23 @@ const (
 // to off (design §10) and is intentionally not part of this record —
 // see TODO in OpenReqLog.
 type ReqLogEntry struct {
-	TS         time.Time
-	ProxyType  string // "http-forward" | "reverse" | "socks5-forward"
-	Platform   string // resolved platform name (wire-protocol name, not UUID)
-	Account    string // empty = random routing
-	Target     string // host or full URL, decided by the ingress
-	Node       string // node hash hex; empty when unassigned
-	EgressIP   string // empty when unknown
-	NetOK      bool
-	HTTPStatus int // 0 when meaningless (tunnel/SOCKS5)
-	Stage      string
-	ResinError string // e.g. UPSTREAM_TIMEOUT; empty on success
-	DurationMs int64
-	BytesUp    int64
-	BytesDown  int64
+	// ID identifies the entry across rolling files ("seq:id"); populated
+	// by queries, zero for entries being appended.
+	ID          ReqLogID
+	TS          time.Time
+	ProxyType   string // "http-forward" | "reverse" | "socks5-forward"
+	Platform    string // resolved platform name (wire-protocol name, not UUID)
+	Account     string // empty = random routing
+	Target      string // host or full URL, decided by the ingress
+	Node        string // node hash hex; empty when unassigned
+	EgressIP    string // empty when unknown
+	NetOK       bool
+	HTTPStatus  int // 0 when meaningless (tunnel/SOCKS5)
+	Stage       string
+	EgressError string // e.g. UPSTREAM_TIMEOUT; empty on success
+	DurationMs  int64
+	BytesUp     int64
+	BytesDown   int64
 }
 
 // reqLogDDL is applied to every rolling file (schema is append-only and
@@ -65,7 +67,7 @@ CREATE TABLE IF NOT EXISTS request_logs(
 	net_ok      INTEGER NOT NULL,
 	http_status INTEGER NOT NULL,
 	stage       TEXT NOT NULL,
-	resin_error TEXT NOT NULL,
+	egress_error TEXT NOT NULL,
 	duration_ms INTEGER NOT NULL,
 	bytes_up    INTEGER NOT NULL,
 	bytes_down  INTEGER NOT NULL
@@ -86,6 +88,9 @@ type ReqLog struct {
 	dir      string
 	keepN    int
 	maxBytes int64
+	// FlushEvery overrides reqLogFlushEvery when > 0 (ops/test knob:
+	// crash-consistency window for the batched writer).
+	FlushEvery time.Duration
 
 	mu      sync.Mutex // guards db, curSeq, curSize
 	db      *sql.DB
@@ -203,7 +208,11 @@ func (r *ReqLog) run() {
 		r.writeBatch(batch)
 		batch = batch[:0]
 	}
-	ticker := time.NewTicker(reqLogFlushEvery)
+	flushEvery := r.FlushEvery
+	if flushEvery <= 0 {
+		flushEvery = reqLogFlushEvery
+	}
+	ticker := time.NewTicker(flushEvery)
 	defer ticker.Stop()
 	for {
 		select {
@@ -248,7 +257,7 @@ func (r *ReqLog) writeBatch(batch []ReqLogEntry) {
 	}
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO request_logs(ts_ns, proxy_type, platform, account, target, node,
-			egress_ip, net_ok, http_status, stage, resin_error,
+			egress_ip, net_ok, http_status, stage, egress_error,
 			duration_ms, bytes_up, bytes_down)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
@@ -263,7 +272,7 @@ func (r *ReqLog) writeBatch(batch []ReqLogEntry) {
 		if _, err := stmt.ExecContext(ctx,
 			e.TS.UTC().UnixNano(),
 			e.ProxyType, e.Platform, e.Account, e.Target, e.Node,
-			e.EgressIP, netOK, e.HTTPStatus, e.Stage, e.ResinError,
+			e.EgressIP, netOK, e.HTTPStatus, e.Stage, e.EgressError,
 			e.DurationMs, e.BytesUp, e.BytesDown); err != nil {
 			stmt.Close()
 			tx.Rollback()

@@ -13,7 +13,7 @@ metadata:
                             # 不得包含 .:|/\@?#%~ 与空白字符
 spec:
   stickyTTL: 168h           # 租约 TTL。租约 expiry 固定，不续期
-  allocation: BALANCED       # BALANCED | PREFER_LOW_LATENCY | PREFER_IDLE_IP
+  allocation: BALANCED       # BALANCED | PREFER_LOW_LATENCY | PREFER_IDLE_IP | ext.<selector>
   passiveBreaker: on        # on | off。off 时数据面发射 Signal 带 breakerExempt=true
   identityPolicyRef: default # 引用的 IdentityPolicy 名称（默认 "default"）
   filter:
@@ -29,7 +29,7 @@ spec:
 |---|---|---|---|---|
 | `metadata.name` | string | 是 | — | 平台名，校验规则见上 |
 | `spec.stickyTTL` | duration | 否 | TODO（见下） | 租约有效期；到期后由调度器到期队列删除，不全表扫描 |
-| `spec.allocation` | enum | 否 | `BALANCED` | 分配策略：`BALANCED`（`(leaseCount+1)×latency`）、`PREFER_LOW_LATENCY`（`latency`）、`PREFER_IDLE_IP`（`leaseCount`） |
+| `spec.allocation` | enum | 否 | `BALANCED` | 分配策略：`BALANCED`（`(leaseCount+1)×latency`）、`PREFER_LOW_LATENCY`（`latency`）、`PREFER_IDLE_IP`（`leaseCount`）、`ext.<selector>`（委托给已注册的扩展 `Selector`，此时粘性租约由扩展自行负责；未注册名字 fail-closed 为 `NO_AVAILABLE_NODES`） |
 | `spec.passiveBreaker` | enum | 否 | TODO（见下） | `on` \| `off`；`off` 时被动失败不计入熔断（`breakerExempt=true`） |
 | `spec.identityPolicyRef` | string | 否 | `default` | IdentityPolicy 名称 |
 | `spec.filter.tags` | string[] | 否 | `[]`（不过滤） | 标签过滤，沿用原语法：无前缀 = ANY（至少一个匹配），`*` 前缀 = MUST（正向条件须由**同一个** Tag 同时满足），`!` 前缀 = MUST_NOT（检查全部 Tag） |
